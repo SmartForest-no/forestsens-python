@@ -169,7 +169,7 @@ class Client:
         (FORESTSENS_GATEWAY_HOST / FORESTSENS_API_KEY) > config file
         (~/.forestsens/config.json, or config_path if given) --
         {"gateway_host": "...", "api_key": "..."}. An API key can only be
-        minted via the web UI's self-service Account page (there's no
+        minted in the web UI (Profile, then API keys; there's no
         bootstrap path that starts from nothing but a key) -- this
         client only ever consumes an existing one.
         """

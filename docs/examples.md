@@ -1,7 +1,7 @@
 # Examples
 
 Four runnable scripts in [`examples/`](../examples), each covering one real, distinct workflow.
-All need a real API key -- see the [Readme](../Readme.md)'s "Getting an API key" section.
+All need a real API key (Profile, then API keys in the web app) -- see the [Readme](../Readme.md)'s "Getting an API key" section.
 
 | Script | Shows | Pipeline used |
 |---|---|---|
@@ -18,12 +18,17 @@ This is a hand-maintained snapshot of the current catalog, not derived at runtim
 
 | `sens` | Input format | Example pipelines |
 |---|---|---|
-| `"drone"` | `.jpg` imagery | `Orthophoto (fast)`, `Tree species detector`, `Forest damage`, `Wheel rut assessment` |
-| `"point"` | `.las` / `.laz` point clouds | `SegmentAnyTree`, `Point2Tree - Semantic segmentation`, `ForAInet` |
+| `"drone"` | `.jpg` imagery (some pipelines take one georeferenced GeoTIFF, see below) | `Orthophoto (fast)`, `Tree species detector`, `Forest damage`, `Wheel rut assessment`, `Seedling Detector`, `Canopy cover (DetecTree)` |
+| `"point"` | `.las` / `.laz` point clouds | `SegmentAnyTree`, `SegmentAnyTree V2`, `Point2Tree - Semantic segmentation`, `ForAInet` |
 
 Every pipeline in the current catalog uses the slot name `"input"` for its first step -- the
 default `run()` and the examples above both assume it, and there's currently no case where you
 need to override it.
+
+**The input must match the pipeline.** A wrong input is only discovered after the machine has started, and then fails
+with a bare "exit code 1" after several minutes. For example `Canopy cover (DetecTree)` needs a georeferenced
+8-bit **RGB** GeoTIFF (three bands; a one-band grayscale or height raster fails). Each pipeline's `instructions`
+field (`pipeline["instructions"]`) says what it expects and produces. More in the platform's API page.
 
 ## Common recipes
 

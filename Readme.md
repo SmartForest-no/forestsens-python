@@ -1,14 +1,11 @@
-> **v1 beta, open to invited testers.** This README (and the `v3.2.0` tag) describe the client for
-> ForestSens' new, OCI-hosted API. It is in beta: new endpoints and fields may be added at any time, and
-> removing or changing anything documented is announced at least 90 days ahead (see the stability policy
-> at `https://<your host>/api-docs/stability.html`). Your host name and an API key come with your
-> invitation.
+> **ForestSens 2 (v1 beta).** This README (and the `v3.2.1` tag) describe the client for the new ForestSens platform,
+> which new API users should use. It is in beta: new endpoints and fields may be added at any time, and removing or
+> changing anything documented is announced at least 90 days ahead (see "Stability and changelog" in the platform
+> documentation, below).
 >
-> Looking for the client for the current, Oracle APEX-based ForestSens system? Use the
-> [`v1.0.0` release](https://github.com/SmartForest-no/forestsens-python/releases/tag/v1.0.0):
-> ```bash
-> pip install git+https://github.com/SmartForest-no/forestsens-python.git@v1.0.0
-> ```
+> Still using the old, Oracle APEX-based ForestSens? It is being phased out. Its client is the
+> [`v1.0.0` release](https://github.com/SmartForest-no/forestsens-python/releases/tag/v1.0.0)
+> (`pip install git+https://github.com/SmartForest-no/forestsens-python.git@v1.0.0`); new work belongs on this client.
 
 # forestsens
 
@@ -20,14 +17,22 @@ and retrieve the results.
 Using an AI coding agent to write your integration? See [`llms.txt`](llms.txt) -- a terse,
 structured reference built for that instead of this narrative README.
 
-The platform's own documentation (getting started, HTTP details, API reference, stability policy,
-changelog) is served by ForestSens itself at `https://<your host>/api-docs/`; its `llms.txt` has the
-platform-side instructions for assistants.
+The platform's own documentation is served by ForestSens itself at `https://<your host>/api-docs/`: Getting
+started, the HTTP API, this Python SDK, use with AI assistants, the OpenAPI reference, and Stability and
+changelog. Its `llms.txt` has the platform-side instructions for assistants.
+
+## Before you start
+
+1. **An account.** Sign up in the ForestSens web app (the link is on forestsens.com, below the video). Sign-up
+   requests are approved by an operator or by your account's admin, so give it a little time.
+2. **An API key** from the web app: **Profile**, then **API keys** (see below).
+3. **Your host**: the address the web app is served from, for example
+   `mvym2zsszqqwnjdr6ypbzgq7yq.apigateway.eu-frankfurt-1.oci.customer-oci.com` (with or without `https://`).
 
 ## Install
 
 ```bash
-pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.2.0
+pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.2.1
 ```
 
 (Or `@main` for the latest commit on the default branch, if you want to track development rather
@@ -85,14 +90,13 @@ client, and handle errors.
 
 ## Getting an API key
 
-An API key (`fs_...`) is what authenticates every call this client makes -- a long-lived
-credential that only ends when revoked. Generate one yourself from your **Account** page in the
-ForestSens web app. A **ForestSens administrator** can also issue one for you, if you'd rather ask
-than self-service.
+An API key (`fs_...`) authenticates every call this client makes. Generate one yourself in the ForestSens web
+app: **Profile**, then **API keys**. An account admin can also issue one for a member of the account.
 
-The key is shown **exactly once** at creation -- save it immediately; there's no way to retrieve
-it again later (only its prefix, for identification, stays visible afterward). If it's ever lost or
-compromised, revoke it and issue a new one.
+The key is shown **exactly once** at creation -- save it immediately; there is no way to retrieve it later (only its
+prefix stays visible). **Keys expire**: by default after 365 days (you can choose 1 to 365 days when you create one;
+an expired key answers `401 unauthenticated`, "API key expired"), so create the next one in good time. If a key is
+ever lost or compromised, revoke it and issue a new one. Keep it out of files you commit.
 
 ## Configuration
 
@@ -163,28 +167,34 @@ upload_id = client.upload_files("path/to/your/photos", project=project, private=
 client.set_upload_shares(upload_id, ["anna@example.com"])   # share a private dataset with a colleague
 ```
 
-Needs a ForestSens that has `GET /users/members` (members lookup); sharing by user id works without it.
 
 ### Errors
 
-Every call can raise `forestsens.ForestSensAPIError(status, code, message, details)` -- `code` is
-a machine-readable string (`"unauthenticated"`, `"not_found"`, `"validation_error"`,
-`"quota_exceeded"`, ...), not just an HTTP status. `forestsens.BatchFailedError` is a subclass
-raised specifically by `wait_for_batch` when the batch itself reaches `status="failed"` (as
-opposed to a transport/request error) -- it carries the full batch dict (`exc.batch`), including
-each step's own `error`/`log_tail`, so you can inspect what actually went wrong without a second
-call.
+Every call can raise `forestsens.ForestSensAPIError(status, code, message, details)` -- `code` is a machine-readable
+string, not just an HTTP status. The ones you will meet:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 401 | `unauthenticated` | The key is wrong, revoked or expired. |
+| 403 | `forbidden` | Your role may not do this (for example deleting data needs an account admin). |
+| 404 | `not_found` | Wrong id, or the dataset is private and not shared with you. |
+| 413 | `storage_limit_exceeded` | A dataset or your account would hold more data than allowed. Retrying does not help: delete datasets, split the dataset, or ask for a higher limit. |
+| 422 | `validation_error` | The request is wrong, or (on completing an upload) some files did not arrive: `details` names them; upload them and call again. |
+| 429 | `rate_limited`, `quota_exceeded` | Too many requests or batches; wait the `Retry-After` seconds. |
+
+The limits and the full error table are in the platform documentation (API page). `forestsens.BatchFailedError` is a
+subclass raised specifically by `wait_for_batch` when the batch itself reaches `status="failed"` (as opposed to a
+transport/request error) -- it carries the full batch dict (`exc.batch`), including each step's own
+`error`/`log_tail`, so you can inspect what went wrong without a second call.
 
 ## What this client doesn't cover
 
-This wraps a subset of the real ForestSens REST API -- upload, batch, and artifact download.
-API-key management and browsing typed result tables (detections, segments, tree inventory) aren't
-included yet. You can always reach those directly over HTTP with your API key (`X-Api-Key` header,
-against the same gateway host prefixed with `/v1-key/` instead of `/v1/`) even though this package
-doesn't wrap them.
+It wraps uploading, datasets, projects and sharing, batches and artifact download. API-key management and browsing
+typed result tables (detections, segments, tree inventory) are not included yet; reach them directly over HTTP with
+your API key (`X-Api-Key` header, against the same host prefixed with `/v1-key/` instead of `/v1/`).
 
-Interactive docs (`/docs`, `/openapi.json`) aren't publicly exposed on this deployment -- ask a
-ForestSens administrator for the full API reference if you need it.
+The complete, always-current API reference is public: `https://<your host>/api-docs/reference.html`, and as
+machine-readable OpenAPI at `https://<your host>/api-docs/openapi.json`.
 
 ## Development
 
@@ -196,23 +206,3 @@ pytest -q
 ## License
 
 MIT -- see [LICENSE](LICENSE).
-
-<details>
-<summary>What changed from the old (pre-2.0.0) package</summary>
-
-Earlier versions of this repository targeted a different, older ForestSens API and were never
-actually published as an installable package -- there's nothing real to upgrade from, but if
-you're coming from that code, here's what's different:
-
-| | Old | `2.0.0` |
-|---|---|---|
-| Auth | `apitoken` header, a single flat token | `X-Api-Key` header, issued per-key by an admin, individually revocable |
-| Batch submission | `{"batch_name": str, "algorithm": <numeric id>}` | `{"pipeline_id": str, "inputs": [{"slot": str, "upload_id": str}]}` |
-| Upload mechanism | Real OCI SDK (`oci` package), used directly against Object Storage | No `oci` dependency at all -- plain HTTP PUT to a pre-authenticated URL (small files) or a backend-mediated resumable multipart protocol (large files) |
-| Endpoints | Flat, unversioned (`/batches`, `/algorithms`) | Versioned (`/v1/...`), envelope-wrapped responses |
-| Response shape | Raw JSON, `response.raise_for_status()` | `{"data", "meta", "error"}` envelope, parsed into `ForestSensAPIError` on failure |
-| Package name / import | `forestsensapi` | `forestsens` |
-
-If you have code written against the old API, it needs a real rewrite, not a patch -- the auth
-mechanism, the request/response shapes, and the upload mechanism all changed.
-</details>

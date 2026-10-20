@@ -1,9 +1,11 @@
 # ForestSens API reference (subset used by this client)
 
-This describes the real REST endpoints the `forestsens` package wraps -- the subset needed for
-upload/batch/download. It is not the full ForestSens API (which also covers account/API-key
-administration, typed result tables, and more) -- see the [Readme](../Readme.md)'s "Full API
-reference" section for the complete, always-current OpenAPI spec.
+This describes the real REST endpoints the `forestsens` package wraps for upload, batch and download. It is
+not the full ForestSens API (which also covers projects, sharing, API keys, typed result tables, and more); the
+complete, always-current reference is public at `https://<your host>/api-docs/reference.html`
+(machine-readable: `https://<your host>/api-docs/openapi.json`).
+
+Paths below are written `/v1/...`; the client sends them to the API-key route, `/v1-key/...`, on your host.
 
 Every response is wrapped in an envelope: `{"data": ..., "meta": {...}, "error": null | {"code",
 "message", "details"}}`. This client raises `forestsens.ForestSensAPIError` whenever `error` is
@@ -13,8 +15,8 @@ non-null.
 
 All requests carry `X-Api-Key: fs_...` and go through the dedicated `/v1-key/{path*}` route (not
 `/v1/{path*}`, which requires a browser-issued JWT this client never has). A user generates their
-own API key from their Account page, or a ForestSens administrator issues one for them -- see the
-[Readme](../Readme.md)'s "Getting an API key" section.
+own API key in the web app (Profile, then API keys), or an account admin issues one for them; keys expire
+(365 days by default) -- see the [Readme](../Readme.md)'s "Getting an API key" section.
 
 ## `GET /v1/pipelines?sens=<sens_code>`
 
@@ -41,7 +43,9 @@ valid only while the upload's `status` is `"uploading"`.
 
 ## `POST /v1/uploads/{upload_id}/complete`
 
-Marks the upload ready for use as a batch input. Must be called after every file has landed.
+Marks the upload ready for use as a batch input. Must be called after every file has landed: it checks that each
+file is in storage and answers `422` naming the missing ones (the dataset stays `uploading`; upload them and call
+again). It also enforces the storage limits (`413 storage_limit_exceeded`, see the platform's API page).
 
 ## `POST /v1/batches`
 

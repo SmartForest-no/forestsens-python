@@ -2,6 +2,9 @@
 > which new API users should use. It is in beta: new endpoints and fields may be added at any time, and removing or
 > changing anything documented is announced at least 90 days ahead (see "Stability and changelog" in the platform
 > documentation, below).
+>
+> This repository was called `forestsens-api` before. Search results and older links may still use that name, and may show
+> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.2.1` or newer with the new platform.
 
 
 # forestsens

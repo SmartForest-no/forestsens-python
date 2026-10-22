@@ -1,14 +1,11 @@
-> **ForestSens 2 (v1 beta).** This README (and the `v3.2.1` tag) describe the client for the new ForestSens platform,
+> **ForestSens 2** This README (and the `v3.2.1` tag) describe the client for the new ForestSens platform,
 > which new API users should use. It is in beta: new endpoints and fields may be added at any time, and removing or
 > changing anything documented is announced at least 90 days ahead (see "Stability and changelog" in the platform
 > documentation, below).
 >
-> Still using the old, Oracle APEX-based ForestSens? It is being phased out. Its client is the
-> [`v1.0.0` release](https://github.com/SmartForest-no/forestsens-python/releases/tag/v1.0.0)
-> (`pip install git+https://github.com/SmartForest-no/forestsens-python.git@v1.0.0`); new work belongs on this client.
->
 > This repository was called `forestsens-api` before. Search results and older links may still use that name, and may show
 > old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.2.1` or newer with the new platform.
+
 
 # forestsens
 

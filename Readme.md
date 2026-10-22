@@ -6,6 +6,9 @@
 > Still using the old, Oracle APEX-based ForestSens? It is being phased out. Its client is the
 > [`v1.0.0` release](https://github.com/SmartForest-no/forestsens-python/releases/tag/v1.0.0)
 > (`pip install git+https://github.com/SmartForest-no/forestsens-python.git@v1.0.0`); new work belongs on this client.
+>
+> This repository was called `forestsens-api` before. Search results and older links may still use that name, and may show
+> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.2.1` or newer with the new platform.
 
 # forestsens
 

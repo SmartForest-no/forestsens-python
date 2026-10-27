@@ -1,10 +1,10 @@
-> **ForestSens 2** This README (and the `v3.3.1` tag) describe the client for the new ForestSens platform,
+> **ForestSens 2** This README (and the `v3.4.0` tag) describe the client for the new ForestSens platform,
 > which new API users should use. It is in beta: new endpoints and fields may be added at any time, and removing or
 > changing anything documented is announced at least 90 days ahead (see "Stability and changelog" in the platform
 > documentation, below).
 >
 > This repository was called `forestsens-api` before. Search results and older links may still use that name, and may show
-> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.3.1` or newer with the new platform.
+> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.4.0` or newer with the new platform.
 
 
 # forestsens
@@ -32,7 +32,7 @@ changelog. Its `llms.txt` has the platform-side instructions for assistants.
 ## Install
 
 ```bash
-pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.3.1
+pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.4.0
 ```
 
 (Or `@main` for the latest commit on the default branch, if you want to track development rather
@@ -135,7 +135,7 @@ client = Client()  # picks up the env vars above
 |---|---|---|
 | `list_pipelines(sens=None, include_retired=False, include_drafts=False)` | `list[Pipeline]` | Lists available pipelines (the newest version of each), optionally filtered by sens (`"drone"`, `"point"`, ...); `include_retired=True` adds older versions, `include_drafts=True` your account's drafts. `Pipeline` is a real `dict` (`pipeline["id"]` works) with a friendly `.id`/`.name`/`.description` and a clean repr -- printing one shows just its name, not the full internal graph/id payload. |
 | `find_pipeline(name, sens=None)` | `Pipeline` | Looks up a single pipeline by its exact display name (e.g. copied from the web UI) instead of filtering/indexing `list_pipelines()` yourself. Raises `LookupError` (with the real available names) if there's no match, or more than one. |
-| `upload_files(paths, name=None, on_progress=None, project=None, private=False)` | `str` (upload id) | Uploads a file, a folder (its top-level files, not recursive), or a list mixing either, as a single dataset. `on_progress`, if given, is called as `on_progress(filename, loaded_bytes, total_bytes)` while each file uploads (see below). `project` (a `Project`, id or exact name) puts it in a project; `private=True` makes it visible only to you, account admins and members you share it with. |
+| `upload_files(paths, name=None, on_progress=None, project=None, private=False, concurrency=4)` | `str` (upload id) | Uploads a file, a folder (its top-level files, not recursive), or a list mixing either, as a single dataset. Files up to 16 MB are sent `concurrency` at a time (4 by default, like the web app; `1` sends them one after another); larger files follow in 16 MB chunks. `on_progress`, if given, is called as `on_progress(filename, loaded_bytes, total_bytes)` while each file uploads (see below). `project` (a `Project`, id or exact name) puts it in a project; `private=True` makes it visible only to you, account admins and members you share it with. |
 | `create_batch(pipeline_id, inputs, use_latest_version=False)` | `Batch` | Starts a pipeline run. `inputs` is `[{"slot": str, "upload_id": str}, ...]`. Warns (`ForestSensNewerVersionWarning`) when `pipeline_id` is an older version; `use_latest_version=True` runs the newest one instead. `Batch` is the same friendly-`dict` treatment as `Pipeline` (`.id`/`.status`, `batch["status"]` both work). |
 | `get_batch(batch_id)` | `Batch` | Fetches a batch's current status/detail. |
 | `list_batches(status=None, upload_id=None, created_by=None, sort="created", direction="desc", limit=20, cursor=None)` | `(list[Batch], next_cursor)` | One page of batches, newest first by default. No pipeline filter -- filter the returned batches' `pipeline_id` yourself if you only want one pipeline's. |
@@ -163,6 +163,7 @@ client.upload_files("path/to/your/photos", on_progress=lambda name, done, total:
 # or, with run(): client.run(pipeline, "path/to/your/photos", "downloads", on_upload_progress=...)
 ```
 
+With several files uploading at once (the default), the calls for different files interleave, one call at a time.
 It is called with `0` when a file starts, about once per percent while it uploads (once per chunk for large files),
 and with `total` when it is done. After a retry, `loaded_bytes` can start over from a lower value.
 

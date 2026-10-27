@@ -553,8 +553,11 @@ class Client:
         # "k3x9@2" names one (possibly older, retired) version: look among all versions.
         pipelines = self.list_pipelines(sens=sens, include_retired="@" in query)
         needle = query.lower()
+        base, _, number = needle.partition("@")
         strategies = (
             lambda p: p.short_id.lower() == needle,
+            # "k3x9@1": the first version keeps the plain short id "k3x9".
+            lambda p: bool(number) and p.short_id.lower() == base and str(p.get("version") or 1) == number,
             lambda p: p.get("name") == query,
             lambda p: needle in (p.get("name") or "").lower(),
             lambda p: str(p.get("id")).startswith(needle),

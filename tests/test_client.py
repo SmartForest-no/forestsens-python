@@ -814,3 +814,14 @@ def test_list_pipelines_flags_and_at_n_lookup():
         found = client.find_pipeline("k3x9@2")
         assert mock_request.call_args.kwargs["params"] == {"include_retired": "true"}
     assert found["id"] == "p-2" and repr(found) == "Pipeline(short_id='k3x9@2', name='Canopy', version=2)"
+
+
+def test_find_pipeline_at_1_is_the_first_version():
+    client = make_client()
+    rows = [
+        {"id": "p-1", "short_id": "k3x9", "name": "Canopy", "version": 1},
+        {"id": "p-2", "short_id": "k3x9@2", "name": "Canopy", "version": 2},
+    ]
+    with patch("requests.Session.request") as mock_request:
+        mock_request.return_value = envelope_response(data=rows)
+        assert client.find_pipeline("k3x9@1")["id"] == "p-1"

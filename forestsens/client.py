@@ -15,12 +15,13 @@ import mimetypes
 import os
 import re
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
 import requests
 
-from .errors import BatchFailedError, ForestSensAPIError
+from .errors import BatchFailedError, ForestSensAPIError, ForestSensNewerVersionWarning
 
 # Must match forestsens/services/uploads.py's MULTIPART_CHUNK_SIZE_BYTES --
 # kept in sync by hand (same as the frontend does), not derived at
@@ -56,7 +57,9 @@ class Pipeline(dict):
             raise AttributeError(key) from exc
 
     def __repr__(self) -> str:
-        return f"Pipeline(short_id={self.short_id!r}, name={self.get('name')!r})"
+        version = self.get("version") or 1
+        suffix = f", version={version!r}" if version > 1 else ""
+        return f"Pipeline(short_id={self.short_id!r}, name={self.get('name')!r}{suffix})"
 
     def __str__(self) -> str:
         return f"{self.get('name') or '(unnamed)'} [{self.short_id}]"
@@ -525,9 +528,19 @@ class Client:
 
     # -- pipelines ------------------------------------------------------------
 
-    def list_pipelines(self, sens: str | None = None) -> list[Pipeline]:
-        params = {"sens": sens} if sens else None
-        return [Pipeline(d) for d in self._get("/v1/pipelines", params=params)]
+    def list_pipelines(
+        self, sens: str | None = None, *, include_retired: bool = False, include_drafts: bool = False
+    ) -> list[Pipeline]:
+        """The pipelines you can run: the newest version of each. `include_retired=True` also lists older versions
+        (still runnable by their id or `short_id@N`), `include_drafts=True` your account's drafts."""
+        params: dict[str, Any] = {}
+        if sens:
+            params["sens"] = sens
+        if include_retired:
+            params["include_retired"] = "true"
+        if include_drafts:
+            params["include_drafts"] = "true"
+        return [Pipeline(d) for d in self._get("/v1/pipelines", params=params or None)]
 
     def find_pipeline(self, query: str, sens: str | None = None) -> Pipeline:
         """Finds one pipeline by its short id ("k3x9", as printed by
@@ -537,7 +550,8 @@ class Client:
         one. Raises LookupError with the real candidates if nothing matches
         or if more than one does.
         """
-        pipelines = self.list_pipelines(sens=sens)
+        # "k3x9@2" names one (possibly older, retired) version: look among all versions.
+        pipelines = self.list_pipelines(sens=sens, include_retired="@" in query)
         needle = query.lower()
         strategies = (
             lambda p: p.short_id.lower() == needle,
@@ -560,12 +574,31 @@ class Client:
 
     # -- batches ------------------------------------------------------------
 
-    def create_batch(self, pipeline_id: str, inputs: list[dict[str, Any]]) -> Batch:
+    def create_batch(
+        self, pipeline_id: str, inputs: list[dict[str, Any]], *, use_latest_version: bool = False
+    ) -> Batch:
         """inputs: [{"slot": str, "upload_id": str}, ...] -- see
         list_pipelines()'s returned graph for a given pipeline's expected
         slot names.
+
+        Versions: a pipeline's short id runs its newest published version; an older version's id or `short_id@N`
+        runs exactly that version, and a ForestSensNewerVersionWarning says a newer one exists.
+        `use_latest_version=True` runs the newest version whatever id is given. The returned batch's
+        `pipeline_id` is the version that runs.
         """
-        return Batch(self._post("/v1/batches", {"pipeline_id": pipeline_id, "inputs": inputs}))
+        body: dict[str, Any] = {"pipeline_id": pipeline_id, "inputs": inputs}
+        if use_latest_version:
+            body["use_latest_version"] = True
+        batch = Batch(self._post("/v1/batches", body))
+        newer = batch.get("newer_pipeline_version")
+        if newer:
+            warnings.warn(
+                f"pipeline {newer.get('name') or pipeline_id!r} has a newer version ({newer.get('version')}); this batch "
+                f"runs the older one. Use the short id {newer.get('short_id')!r} or use_latest=True for the newest.",
+                ForestSensNewerVersionWarning,
+                stacklevel=2,
+            )
+        return batch
 
     def get_batch(self, batch_id: str) -> Batch:
         return Batch(self._get(f"/v1/batches/{batch_id}"))
@@ -659,6 +692,7 @@ class Client:
         on_upload_progress: Callable[[str, int, int], None] | None = None,
         project: str | dict[str, Any] | None = None,
         private: bool = False,
+        use_latest: bool = False,
     ) -> list[str]:
         """Upload -> start a batch -> wait -> download, for the common
         single-input case -- collapses the whole upload/create_batch/
@@ -673,13 +707,18 @@ class Client:
 
         `on_progress` reports the batch's status changes; `on_upload_progress` reports the upload
         as `(filename, loaded_bytes, total_bytes)`, see upload_files(). `project` and `private` are
-        passed to upload_files() too.
+        passed to upload_files() too. `use_latest=True` runs the pipeline's newest published version even
+        when `pipeline` is an older version (see create_batch()).
         """
         pipeline_id = pipeline["id"] if isinstance(pipeline, dict) else pipeline
         upload_id = self.upload_files(
             paths, name=name, on_progress=on_upload_progress, project=project, private=private
         )
-        batch = self.create_batch(pipeline_id, [{"slot": slot, "upload_id": upload_id}])
+        inputs = [{"slot": slot, "upload_id": upload_id}]
+        if use_latest:
+            batch = self.create_batch(pipeline_id, inputs, use_latest_version=True)
+        else:
+            batch = self.create_batch(pipeline_id, inputs)
         batch = self.wait_for_batch(
             batch["id"], poll_interval=poll_interval, timeout=timeout, on_progress=on_progress
         )

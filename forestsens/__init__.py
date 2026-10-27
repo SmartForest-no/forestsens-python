@@ -1,5 +1,5 @@
 from .client import Batch, Client, Member, Pipeline, Project, Upload
-from .errors import BatchFailedError, ForestSensAPIError
+from .errors import BatchFailedError, ForestSensAPIError, ForestSensNewerVersionWarning
 
 __all__ = [
     "Client",
@@ -10,4 +10,5 @@ __all__ = [
     "Member",
     "ForestSensAPIError",
     "BatchFailedError",
+    "ForestSensNewerVersionWarning",
 ]

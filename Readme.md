@@ -1,10 +1,10 @@
-> **ForestSens 2** This README (and the `v3.3.0` tag) describe the client for the new ForestSens platform,
+> **ForestSens 2** This README (and the `v3.3.1` tag) describe the client for the new ForestSens platform,
 > which new API users should use. It is in beta: new endpoints and fields may be added at any time, and removing or
 > changing anything documented is announced at least 90 days ahead (see "Stability and changelog" in the platform
 > documentation, below).
 >
 > This repository was called `forestsens-api` before. Search results and older links may still use that name, and may show
-> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.3.0` or newer with the new platform.
+> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.3.1` or newer with the new platform.
 
 
 # forestsens
@@ -32,7 +32,7 @@ changelog. Its `llms.txt` has the platform-side instructions for assistants.
 ## Install
 
 ```bash
-pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.3.0
+pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.3.1
 ```
 
 (Or `@main` for the latest commit on the default branch, if you want to track development rather

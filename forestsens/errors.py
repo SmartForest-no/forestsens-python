@@ -34,3 +34,9 @@ class BatchFailedError(ForestSensAPIError):
         self.batch = batch
         message = batch.get("error_message") or "batch failed"
         super().__init__(status=200, code="batch_failed", message=message, details=batch.get("steps"))
+
+
+class ForestSensNewerVersionWarning(UserWarning):
+    """Issued (with `warnings.warn`, not raised) when a batch was started on a pipeline version that has a newer
+    published version. The batch runs the version that was asked for; pass `use_latest=True` to `run()` (or
+    `use_latest_version=True` to `create_batch()`), or use the pipeline's short id, to run the newest one."""

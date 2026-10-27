@@ -748,3 +748,80 @@ def test_gateway_host_may_be_given_with_a_scheme_and_trailing_slash():
         client = Client(gateway_host=given, api_key="fs_x")
         assert client.gateway_host == "h.example.com"
         assert client._url("/v1/pipelines") == "https://h.example.com/v1-key/pipelines"
+
+
+# -- pipeline versions ---------------------------------------------------------
+
+
+def test_create_batch_sends_use_latest_version_only_when_asked():
+    client = make_client()
+    with patch("requests.Session.request") as mock_request:
+        mock_request.return_value = envelope_response(data={"id": "batch-1", "status": "queued"})
+        client.create_batch("pipeline-1", [{"slot": "input", "upload_id": "u"}], use_latest_version=True)
+    assert mock_request.call_args.kwargs["json"]["use_latest_version"] is True
+
+
+def test_create_batch_warns_when_a_newer_version_exists():
+    import warnings
+
+    from forestsens import ForestSensNewerVersionWarning
+
+    client = make_client()
+    newer = {"id": "p-2", "short_id": "k3x9", "version": 2, "name": "Canopy"}
+    with patch("requests.Session.request") as mock_request:
+        mock_request.return_value = envelope_response(
+            data={"id": "batch-1", "status": "queued", "pipeline_id": "p-1", "newer_pipeline_version": newer}
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            batch = client.create_batch("p-1", [{"slot": "input", "upload_id": "u"}])
+    assert batch["id"] == "batch-1"
+    assert any(issubclass(w.category, ForestSensNewerVersionWarning) and "k3x9" in str(w.message) for w in caught)
+
+
+def test_no_warning_on_the_newest_version():
+    import warnings
+
+    client = make_client()
+    with patch("requests.Session.request") as mock_request:
+        mock_request.return_value = envelope_response(data={"id": "b", "status": "queued", "newer_pipeline_version": None})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            client.create_batch("p", [{"slot": "input", "upload_id": "u"}])
+
+
+def test_run_passes_use_latest(tmp_path):
+    client = make_client()
+    with patch.object(client, "upload_files", return_value="upload-1"), patch.object(
+        client, "create_batch", return_value=Batch({"id": "batch-1"})
+    ) as create, patch.object(client, "wait_for_batch", return_value=Batch({"id": "batch-1"})), patch.object(
+        client, "download_artifacts", return_value=[]
+    ):
+        client.run("pipeline-1", str(tmp_path), tmp_path, use_latest=True)
+    create.assert_called_once_with("pipeline-1", [{"slot": "input", "upload_id": "upload-1"}], use_latest_version=True)
+
+
+def test_list_pipelines_flags_and_at_n_lookup():
+    client = make_client()
+    rows = [
+        {"id": "p-1", "short_id": "k3x9", "name": "Canopy", "version": 1},
+        {"id": "p-2", "short_id": "k3x9@2", "name": "Canopy", "version": 2},
+    ]
+    with patch("requests.Session.request") as mock_request:
+        mock_request.return_value = envelope_response(data=rows)
+        client.list_pipelines(include_retired=True, include_drafts=True)
+        assert mock_request.call_args.kwargs["params"] == {"include_retired": "true", "include_drafts": "true"}
+        found = client.find_pipeline("k3x9@2")
+        assert mock_request.call_args.kwargs["params"] == {"include_retired": "true"}
+    assert found["id"] == "p-2" and repr(found) == "Pipeline(short_id='k3x9@2', name='Canopy', version=2)"
+
+
+def test_find_pipeline_at_1_is_the_first_version():
+    client = make_client()
+    rows = [
+        {"id": "p-1", "short_id": "k3x9", "name": "Canopy", "version": 1},
+        {"id": "p-2", "short_id": "k3x9@2", "name": "Canopy", "version": 2},
+    ]
+    with patch("requests.Session.request") as mock_request:
+        mock_request.return_value = envelope_response(data=rows)
+        assert client.find_pipeline("k3x9@1")["id"] == "p-1"

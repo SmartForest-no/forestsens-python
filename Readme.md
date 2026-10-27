@@ -1,10 +1,10 @@
-> **ForestSens 2** This README (and the `v3.2.1` tag) describe the client for the new ForestSens platform,
+> **ForestSens 2** This README (and the `v3.3.0` tag) describe the client for the new ForestSens platform,
 > which new API users should use. It is in beta: new endpoints and fields may be added at any time, and removing or
 > changing anything documented is announced at least 90 days ahead (see "Stability and changelog" in the platform
 > documentation, below).
 >
 > This repository was called `forestsens-api` before. Search results and older links may still use that name, and may show
-> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.2.1` or newer with the new platform.
+> old versions (`v1.x`, `v2.x`) that target the old platform; use `v3.3.0` or newer with the new platform.
 
 
 # forestsens
@@ -32,7 +32,7 @@ changelog. Its `llms.txt` has the platform-side instructions for assistants.
 ## Install
 
 ```bash
-pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.2.1
+pip install git+https://github.com/SmartForest-no/forestsens-python.git@v3.3.0
 ```
 
 (Or `@main` for the latest commit on the default branch, if you want to track development rather
@@ -133,14 +133,14 @@ client = Client()  # picks up the env vars above
 
 | Method | Returns | Does |
 |---|---|---|
-| `list_pipelines(sens=None)` | `list[Pipeline]` | Lists available pipelines, optionally filtered by sens (`"drone"`, `"point"`, ...). `Pipeline` is a real `dict` (`pipeline["id"]` works) with a friendly `.id`/`.name`/`.description` and a clean repr -- printing one shows just its name, not the full internal graph/id payload. |
+| `list_pipelines(sens=None, include_retired=False, include_drafts=False)` | `list[Pipeline]` | Lists available pipelines (the newest version of each), optionally filtered by sens (`"drone"`, `"point"`, ...); `include_retired=True` adds older versions, `include_drafts=True` your account's drafts. `Pipeline` is a real `dict` (`pipeline["id"]` works) with a friendly `.id`/`.name`/`.description` and a clean repr -- printing one shows just its name, not the full internal graph/id payload. |
 | `find_pipeline(name, sens=None)` | `Pipeline` | Looks up a single pipeline by its exact display name (e.g. copied from the web UI) instead of filtering/indexing `list_pipelines()` yourself. Raises `LookupError` (with the real available names) if there's no match, or more than one. |
 | `upload_files(paths, name=None, on_progress=None, project=None, private=False)` | `str` (upload id) | Uploads a file, a folder (its top-level files, not recursive), or a list mixing either, as a single dataset. `on_progress`, if given, is called as `on_progress(filename, loaded_bytes, total_bytes)` while each file uploads (see below). `project` (a `Project`, id or exact name) puts it in a project; `private=True` makes it visible only to you, account admins and members you share it with. |
-| `create_batch(pipeline_id, inputs)` | `Batch` | Starts a pipeline run. `inputs` is `[{"slot": str, "upload_id": str}, ...]`. `Batch` is the same friendly-`dict` treatment as `Pipeline` (`.id`/`.status`, `batch["status"]` both work). |
+| `create_batch(pipeline_id, inputs, use_latest_version=False)` | `Batch` | Starts a pipeline run. `inputs` is `[{"slot": str, "upload_id": str}, ...]`. Warns (`ForestSensNewerVersionWarning`) when `pipeline_id` is an older version; `use_latest_version=True` runs the newest one instead. `Batch` is the same friendly-`dict` treatment as `Pipeline` (`.id`/`.status`, `batch["status"]` both work). |
 | `get_batch(batch_id)` | `Batch` | Fetches a batch's current status/detail. |
 | `list_batches(status=None, upload_id=None, created_by=None, sort="created", direction="desc", limit=20, cursor=None)` | `(list[Batch], next_cursor)` | One page of batches, newest first by default. No pipeline filter -- filter the returned batches' `pipeline_id` yourself if you only want one pipeline's. |
 | `wait_for_batch(batch_id, poll_interval=5.0, timeout=None, on_progress=None)` | `Batch` | Polls until the batch reaches `"complete"` or `"failed"`. Raises `BatchFailedError` on failure. `on_progress`, if given, is called once per status change -- pass `on_progress=print` for a one-line log. |
-| `run(pipeline, paths, dest_dir, slot="input", name=None, poll_interval=5.0, timeout=None, on_progress=None, on_upload_progress=None, project=None, private=False)` | `list[str]` (local paths) | The common single-input case in one call: upload -> create a batch -> wait -> download. `pipeline` can be a `Pipeline` or a bare id string. |
+| `run(pipeline, paths, dest_dir, slot="input", name=None, poll_interval=5.0, timeout=None, on_progress=None, on_upload_progress=None, project=None, private=False, use_latest=False)` | `list[str]` (local paths) | The common single-input case in one call: upload -> create a batch -> wait -> download. `pipeline` can be a `Pipeline` or a bare id string. `use_latest=True` follows newer versions of the pipeline. |
 | `download_artifacts(batch_id, dest_dir)` | `list[str]` (local paths) | Downloads every artifact the batch produced. |
 | `list_projects()` / `create_project(name)` / `rename_project(project, name)` / `delete_project(project)` | `list[Project]` / `Project` / `Project` / `None` | Projects group datasets. Deleting a project keeps its datasets. A `project` argument is a `Project`, an id or an exact name. |
 | `list_uploads(project=None, no_project=False, created_by=None, status=None, sort="created", direction="desc", limit=20, cursor=None)` | `(list[Upload], next_cursor)` | One page of the datasets you can see, newest first. `Upload` has `.id`, `.name`, `.visibility`, `.project_name`, `.shared_with_count`, `.files`. |
@@ -148,6 +148,13 @@ client = Client()  # picks up the env vars above
 | `update_upload(upload_id, name=None, project=<unchanged>, private=None)` | `Upload` | Renames a dataset, moves it to a project (`project=None` takes it out of its project) or makes it private (`private=True`) or visible to the account again (`private=False`). Only what you pass changes. |
 | `list_members()` | `list[Member]` | The members of your account (`.user_id`, `.email`, `.display_name`). |
 | `get_upload_shares(upload_id)` / `set_upload_shares(upload_id, users)` | `list[Member]` | Whom a private dataset is shared with. `set_upload_shares` **replaces** the list: pass everyone who should have access (user ids, e-mail addresses or `Member`s); an empty list removes all shares. |
+
+**Pipeline versions.** A pipeline gets a new version when ForestSens (or your account) changes it. Its **short id**
+(`k3x9`, printed by `find_pipeline`) and its **name** always run the newest published version. An older version's
+**id** or `k3x9@2` runs exactly that version, so results stay reproducible; the client then issues a
+`ForestSensNewerVersionWarning` (a Python warning, not an error). To always follow new versions from a pinned id, pass
+`use_latest=True` to `run()` (or `use_latest_version=True` to `create_batch()`). Each batch's `pipeline_id` says which
+version ran.
 
 **Upload progress.** Uploads are silent by default. Pass a callback to see them:
 

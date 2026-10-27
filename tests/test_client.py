@@ -825,3 +825,108 @@ def test_find_pipeline_at_1_is_the_first_version():
     with patch("requests.Session.request") as mock_request:
         mock_request.return_value = envelope_response(data=rows)
         assert client.find_pipeline("k3x9@1")["id"] == "p-1"
+
+
+# -- parallel uploads ----------------------------------------------------
+
+
+def _created_for(names):
+    return {
+        "id": "upload-1",
+        "files": [
+            {"id": f"file-{i}", "filename": n, "upload_url": f"https://par.example/{n}"} for i, n in enumerate(names)
+        ],
+    }
+
+
+def test_upload_files_sends_small_files_in_parallel(tmp_path):
+    import threading
+    import time as _time
+
+    names = [f"img{i}.jpg" for i in range(8)]
+    for n in names:
+        (tmp_path / n).write_bytes(b"x" * 10)
+    active, peak, lock = [0], [0], threading.Lock()
+
+    def slow_put(url, data=None, **kwargs):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        _time.sleep(0.05)
+        with lock:
+            active[0] -= 1
+        return MagicMock(ok=True, status_code=200)
+
+    with patch("requests.Session.request") as mock_request, patch("requests.put", side_effect=slow_put) as mock_put:
+        mock_request.side_effect = [envelope_response(data=_created_for(names)), envelope_response(data={"id": "upload-1"})]
+        make_client().upload_files(tmp_path, concurrency=4)
+
+    assert mock_put.call_count == 8
+    assert peak[0] == 4  # never more than `concurrency` at once, and really in parallel
+    assert mock_request.call_args_list[-1].args[1].endswith("/uploads/upload-1/complete")
+
+
+def test_upload_files_concurrency_one_is_one_after_another(tmp_path):
+    import threading
+
+    names = ["a.jpg", "b.jpg", "c.jpg"]
+    for n in names:
+        (tmp_path / n).write_bytes(b"x")
+    active, peak, lock = [0], [0], threading.Lock()
+
+    def put(url, data=None, **kwargs):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        with lock:
+            active[0] -= 1
+        return MagicMock(ok=True, status_code=200)
+
+    with patch("requests.Session.request") as mock_request, patch("requests.put", side_effect=put):
+        mock_request.side_effect = [envelope_response(data=_created_for(names)), envelope_response(data={"id": "upload-1"})]
+        make_client().upload_files(tmp_path, concurrency=1)
+    assert peak[0] == 1
+
+
+def test_a_file_that_keeps_failing_raises_and_the_dataset_is_not_completed(tmp_path, monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)  # skip the retry backoff
+    names = ["good.jpg", "bad.jpg"]
+    for n in names:
+        (tmp_path / n).write_bytes(b"x")
+
+    def put(url, data=None, **kwargs):
+        return MagicMock(ok=not url.endswith("bad.jpg"), status_code=200 if not url.endswith("bad.jpg") else 500)
+
+    with patch("requests.Session.request") as mock_request, patch("requests.put", side_effect=put):
+        mock_request.side_effect = [envelope_response(data=_created_for(names))]
+        with pytest.raises(ForestSensAPIError):
+            make_client().upload_files(tmp_path)
+    assert mock_request.call_count == 1  # created, never completed
+
+
+def test_progress_callbacks_from_parallel_uploads_never_overlap(tmp_path):
+    import threading
+    import time as _time
+
+    names = [f"img{i}.jpg" for i in range(6)]
+    for n in names:
+        (tmp_path / n).write_bytes(b"x" * 1000)
+    inside, overlapped, seen = [0], [False], set()
+
+    def on_progress(name, loaded, total):
+        inside[0] += 1
+        if inside[0] > 1:
+            overlapped[0] = True
+        _time.sleep(0.005)
+        seen.add(name)
+        inside[0] -= 1
+
+    def put(url, data=None, **kwargs):
+        while data.read(256):
+            pass
+        return MagicMock(ok=True, status_code=200)
+
+    with patch("requests.Session.request") as mock_request, patch("requests.put", side_effect=put):
+        mock_request.side_effect = [envelope_response(data=_created_for(names)), envelope_response(data={"id": "upload-1"})]
+        make_client().upload_files(tmp_path, on_progress=on_progress)
+    assert not overlapped[0] and seen == set(names)

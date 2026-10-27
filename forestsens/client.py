@@ -14,8 +14,10 @@ import json
 import mimetypes
 import os
 import re
+import threading
 import time
 import warnings
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,6 +33,8 @@ from .errors import BatchFailedError, ForestSensAPIError, ForestSensNewerVersion
 MULTIPART_CHUNK_SIZE_BYTES = 16 * 1024 * 1024
 
 MAX_ATTEMPTS = 3
+# Files uploaded at the same time by upload_files(), the same number the web app uses (frontend MAX_CONCURRENT_UPLOADS).
+DEFAULT_UPLOAD_CONCURRENCY = 4
 DEFAULT_CONFIG_PATH = Path.home() / ".forestsens" / "config.json"
 
 
@@ -243,17 +247,20 @@ class Client:
         on_progress: Callable[[str, int, int], None] | None = None,
         project: str | dict[str, Any] | None = None,
         private: bool = False,
+        concurrency: int = DEFAULT_UPLOAD_CONCURRENCY,
     ) -> str:
         """Creates a dataset from one or more local files and returns its
-        upload_id. Sequential per file, on purpose -- simpler than the
-        frontend's bounded-concurrency pool.
+        upload_id. Files up to 16 MB are sent `concurrency` at a time (default 4, like the web app; 1 sends one
+        after another); larger files are then sent one after another in 16 MB chunks (resumable).
         Each file (or, for a large file, each chunk) is retried up to
-        MAX_ATTEMPTS times with a short backoff before giving up.
+        MAX_ATTEMPTS times with a short backoff before giving up. If a file still fails, the files not
+        started yet are skipped and the error is raised; the dataset stays unfinished.
 
         `on_progress`, if given, is called as `on_progress(filename, loaded_bytes, total_bytes)`:
         with 0 when a file starts, while it uploads (about once per percent; per chunk for large
         files), and with `total_bytes` when it is done. After a retry `loaded_bytes` may start
-        over from a lower value. Default `None` is silent. Example:
+        over from a lower value. With concurrency above 1 the calls for different files interleave (never
+        two at the same moment). Default `None` is silent. Example:
         `on_progress=lambda name, done, total: print(f"{name}: {done / total:.0%}")`.
 
         `project` puts the dataset in a project: a `Project` from list_projects()/create_project(),
@@ -278,19 +285,40 @@ class Client:
         created = self._post("/v1/uploads", body)
         upload_id = created["id"]
         file_by_name = {p.name: p for p in paths}
+        progress_lock = threading.Lock()
 
+        def reporter(name: str, total: int) -> Callable[[int], None] | None:
+            if on_progress is None:
+                return None
+
+            def report(loaded: int) -> None:
+                with progress_lock:  # several upload threads call this; one at a time
+                    on_progress(name, loaded, total)
+
+            return report
+
+        small, large = [], []
         for file_out in created["files"]:
             local_path = file_by_name[file_out["filename"]]
             size = local_path.stat().st_size
-            report = None
-            if on_progress is not None:
-                def report(loaded: int, name: str = local_path.name, total: int = size) -> None:
-                    on_progress(name, loaded, total)
+            (small if size <= MULTIPART_CHUNK_SIZE_BYTES else large).append((file_out, local_path, size))
 
-            if size <= MULTIPART_CHUNK_SIZE_BYTES:
-                self._upload_small_file(file_out["upload_url"], local_path, report)
-            else:
-                self._upload_large_file(upload_id, file_out["id"], local_path, size, report)
+        # Small files straight to Object Storage (pre-authenticated URLs, no API calls), several at a time.
+        if small:
+            with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+                futures = [
+                    pool.submit(self._upload_small_file, file_out["upload_url"], local_path, reporter(local_path.name, size))
+                    for file_out, local_path, size in small
+                ]
+                done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+                failed = [f for f in done if f.exception() is not None]
+                if failed:
+                    for future in futures:
+                        future.cancel()
+                    raise failed[0].exception()
+        # Large files go through the API chunk by chunk; one after another keeps within its rate limit.
+        for file_out, local_path, size in large:
+            self._upload_large_file(upload_id, file_out["id"], local_path, size, reporter(local_path.name, size))
 
         self._post(f"/v1/uploads/{upload_id}/complete", {})
         return upload_id

@@ -930,3 +930,92 @@ def test_progress_callbacks_from_parallel_uploads_never_overlap(tmp_path):
         mock_request.side_effect = [envelope_response(data=_created_for(names)), envelope_response(data={"id": "upload-1"})]
         make_client().upload_files(tmp_path, on_progress=on_progress)
     assert not overlapped[0] and seen == set(names)
+
+
+# -- typed results ---------------------------------------------------------
+
+from forestsens import Detection, Segment, TreeRecord  # noqa: E402
+
+CROWN = {"id": 7, "step_id": "s1", "class": "tree", "confidence": 0.27, "area_m2": 12.5,
+         "geom": {"type": "Polygon", "coordinates": [[[10, 59], [10.1, 59], [10.1, 59.1], [10, 59]]]},
+         "attributes": {}, "created_at": "2026-11-06T11:58:00Z"}
+
+
+def page(rows, next_cursor=None):
+    return envelope_response(rows, pagination={"next_cursor": next_cursor})
+
+
+def test_list_segments_maps_the_filters_and_returns_rows_and_cursor():
+    client = make_client()
+    with patch("requests.Session.get", return_value=page([CROWN], "c2")) as mock_get:
+        rows, cursor = client.list_segments("b1", class_="tree", bbox=(10, 59, 11, 60), confidence_min=None)
+    assert cursor == "c2" and isinstance(rows[0], Segment)
+    assert rows[0].class_ == "tree" and rows[0].area_m2 == 12.5 and rows[0]["class"] == "tree"
+    url = mock_get.call_args.args[0]
+    assert url.endswith("/v1-key/batches/b1/segments")
+    assert mock_get.call_args.kwargs["params"] == {"class": "tree", "bbox": "10,59,11,60", "limit": 1000}
+
+
+def test_each_table_uses_its_own_route():
+    client = make_client()
+    with patch("requests.Session.get", return_value=page([])) as mock_get:
+        client.list_detections("b1")
+        client.list_linear_features("b1")
+        client.list_tree_inventory("b1", species="spruce", dbh_min=20)
+    routes = [c.args[0].rsplit("/", 1)[1] for c in mock_get.call_args_list]
+    assert routes == ["detections", "linear-features", "tree-inventory"]
+    assert mock_get.call_args.kwargs["params"] == {"species": "spruce", "dbh_min": 20, "limit": 1000}
+
+
+def test_get_results_follows_every_page():
+    client = make_client()
+    second = dict(CROWN, id=8)
+    with patch("requests.Session.get", side_effect=[page([CROWN], "c2"), page([second])]) as mock_get:
+        rows = client.get_results("b1", "segments", class_="tree")
+    assert [r.id for r in rows] == [7, 8]
+    assert [c.kwargs["params"].get("cursor") for c in mock_get.call_args_list] == [None, "c2"]
+    assert all(c.kwargs["params"]["class"] == "tree" for c in mock_get.call_args_list)
+
+
+def test_an_unknown_table_is_refused():
+    with pytest.raises(ValueError, match="detections, segments, linear_features, tree_inventory"):
+        make_client().get_results("b1", "crowns")
+
+
+def test_results_geojson_is_a_feature_collection_also_without_geometry():
+    client = make_client()
+    tree = {"id": 3, "step_id": "s1", "species": "spruce", "dbh_cm": 31.0, "height_m": 22.0, "volume_m3": None,
+            "geom": None, "attributes": {}, "created_at": "2026-11-06T11:58:00Z"}
+    with patch("requests.Session.get", return_value=page([tree])):
+        fc = client.results_geojson("b1", "tree_inventory")
+    assert fc["type"] == "FeatureCollection"
+    feature = fc["features"][0]
+    assert feature == {"type": "Feature", "id": 3, "geometry": None,
+                       "properties": {k: v for k, v in tree.items() if k != "geom"}}
+    assert isinstance(TreeRecord(tree), TreeRecord) and "species='spruce'" in repr(TreeRecord(tree))
+
+
+def test_save_results_writes_only_the_tables_the_batch_has(tmp_path):
+    client = make_client()
+    batch = {"id": "b1", "status": "complete", "results": {
+        "segments": {"count": 1, "href": "/v1/batches/b1/segments"}, "detections": None,
+        "linear_features": {"count": 0, "href": "x"}}}
+    with patch("requests.Session.request", return_value=envelope_response(batch)), \
+            patch("requests.Session.get", return_value=page([CROWN])) as mock_get:
+        paths = client.save_results("b1", tmp_path)
+    assert paths == [str(tmp_path / "segments.geojson")]
+    assert json.loads((tmp_path / "segments.geojson").read_text())["features"][0]["id"] == 7
+    assert mock_get.call_count == 1
+
+
+def test_the_rate_limit_is_waited_out_and_then_given_up():
+    client = make_client()
+    limited = envelope_response(error={"code": "rate_limited", "message": "slow down"}, status=429)
+    limited.headers = {"Retry-After": "2"}
+    with patch("requests.Session.get", side_effect=[limited, page([CROWN])]), patch("time.sleep") as sleep:
+        rows, _ = client.list_detections("b1")
+    assert isinstance(rows[0], Detection) and sleep.call_args.args[0] == 2.0
+    with patch("requests.Session.get", return_value=limited), patch("time.sleep") as sleep:
+        with pytest.raises(ForestSensAPIError) as err:
+            client.list_detections("b1")
+    assert err.value.code == "rate_limited" and sleep.call_count == 4  # 5 tries, a wait between each

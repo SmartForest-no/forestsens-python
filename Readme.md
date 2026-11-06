@@ -142,6 +142,11 @@ client = Client()  # picks up the env vars above
 | `wait_for_batch(batch_id, poll_interval=5.0, timeout=None, on_progress=None)` | `Batch` | Polls until the batch reaches `"complete"` or `"failed"`. Raises `BatchFailedError` on failure. `on_progress`, if given, is called once per status change -- pass `on_progress=print` for a one-line log. |
 | `run(pipeline, paths, dest_dir, slot="input", name=None, poll_interval=5.0, timeout=None, on_progress=None, on_upload_progress=None, project=None, private=False, use_latest=False)` | `list[str]` (local paths) | The common single-input case in one call: upload -> create a batch -> wait -> download. `pipeline` can be a `Pipeline` or a bare id string. `use_latest=True` follows newer versions of the pipeline. |
 | `download_artifacts(batch_id, dest_dir)` | `list[str]` (local paths) | Downloads every artifact the batch produced. |
+| `list_detections(batch_id, step_id=None, class_=None, confidence_min=None, bbox=None, limit=1000, cursor=None)` | `(list[Detection], next_cursor)` | One page of a batch's detections. `list_segments(...)` (e.g. tree crowns) and `list_linear_features(...)` (e.g. wheel ruts) take the same filters. `bbox` is `(min_lon, min_lat, max_lon, max_lat)`. |
+| `list_tree_inventory(batch_id, step_id=None, species=None, dbh_min=None, dbh_max=None, limit=1000, cursor=None)` | `(list[TreeRecord], next_cursor)` | One page of a batch's tree inventory. |
+| `get_results(batch_id, table, **filters)` / `iter_results(...)` | `list` / iterator of rows | Every row of one table, all pages. `table` is `"detections"`, `"segments"`, `"linear_features"` or `"tree_inventory"`; filters as the `list_...` method. |
+| `results_geojson(batch_id, table, **filters)` | `dict` | One table as a GeoJSON FeatureCollection (WGS84). |
+| `save_results(batch_id, dest_dir, tables=None)` | `list[str]` (local paths) | Writes `<table>.geojson` for each table the batch has rows in. |
 | `list_projects()` / `create_project(name)` / `rename_project(project, name)` / `delete_project(project)` | `list[Project]` / `Project` / `Project` / `None` | Projects group datasets. Deleting a project keeps its datasets. A `project` argument is a `Project`, an id or an exact name. |
 | `list_uploads(project=None, no_project=False, created_by=None, status=None, sort="created", direction="desc", limit=20, cursor=None)` | `(list[Upload], next_cursor)` | One page of the datasets you can see, newest first. `Upload` has `.id`, `.name`, `.visibility`, `.project_name`, `.shared_with_count`, `.files`. |
 | `get_upload(upload_id)` | `Upload` | One dataset. |
@@ -176,6 +181,25 @@ client.set_upload_shares(upload_id, ["anna@example.com"])   # share a private da
 ```
 
 
+**Results as data.** Pipelines that find things (tree crowns, detections, wheel ruts, a tree inventory) also store
+them as rows you can read, filter and save, besides the result files:
+
+```python
+crowns = client.get_results(batch.id, "segments", confidence_min=0.5)   # all pages, as Segment rows
+print(len(crowns), crowns[0])            # Segment(id=..., class='tree', confidence=0.83, area_m2=21.4)
+print(crowns[0].area_m2, crowns[0].geom["type"])
+
+fc = client.results_geojson(batch.id, "segments", bbox=(10.75, 59.66, 10.78, 59.68))  # a GeoJSON FeatureCollection
+client.save_results(batch.id, "results")  # results/segments.geojson etc., one file per table the batch has
+
+# With geopandas (not needed by this client):
+# gdf = geopandas.GeoDataFrame.from_features(fc["features"], crs="EPSG:4326")
+```
+
+Which tables a batch has is in `batch["results"]` (each `{count, href}`, or `None`). Rows are dicts with attribute
+access; `class` is a Python keyword, so it is `row["class"]` or `row.class_`. Pages hold up to 1000 rows; a
+`429 rate_limited` while paging is waited out (`Retry-After`) and retried.
+
 ### Errors
 
 Every call can raise `forestsens.ForestSensAPIError(status, code, message, details)` -- `code` is a machine-readable
@@ -197,9 +221,9 @@ transport/request error) -- it carries the full batch dict (`exc.batch`), includ
 
 ## What this client doesn't cover
 
-It wraps uploading, datasets, projects and sharing, batches and artifact download. API-key management and browsing
-typed result tables (detections, segments, tree inventory) are not included yet; reach them directly over HTTP with
-your API key (`X-Api-Key` header, against the same host prefixed with `/v1-key/` instead of `/v1/`).
+It wraps uploading, datasets, projects and sharing, batches, artifact download and the typed result tables.
+API-key management is not included; reach it directly over HTTP with your API key (`X-Api-Key` header, against the
+same host prefixed with `/v1-key/` instead of `/v1/`).
 
 The complete, always-current API reference is public: `https://<your host>/api-docs/reference.html`, and as
 machine-readable OpenAPI at `https://<your host>/api-docs/openapi.json`.

@@ -19,7 +19,7 @@ import time
 import warnings
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import requests
 
@@ -134,6 +134,61 @@ class Member(_View):
 
     def __str__(self) -> str:
         return f"{self.get('display_name') or self.get('email')} <{self.get('email')}>"
+
+
+class _ResultRow(_View):
+    """One row of a typed result table: a real dict (row["class"], json.dumps(row)) with attribute access; `.class_`
+    because `class` is a Python keyword. `.geom` is the GeoJSON geometry (WGS84)."""
+
+    @property
+    def class_(self) -> Any:
+        return self.get("class")
+
+    def __repr__(self) -> str:
+        parts = [f"id={self.get('id')!r}"]
+        for key in self._REPR_KEYS:
+            if self.get(key) is not None:
+                parts.append(f"{key}={self.get(key)!r}")
+        return f"{type(self).__name__}({', '.join(parts)})"
+
+    _REPR_KEYS: tuple[str, ...] = ("class", "confidence")
+
+
+class Detection(_ResultRow):
+    """A detected object (a point or box): `.class_`, `.confidence`, `.geom`, `.box_width`, `.box_height`,
+    `.attributes`, `.step_id`."""
+
+
+class Segment(_ResultRow):
+    """A segmented outline, for example a tree crown: `.class_`, `.confidence`, `.geom` (a polygon), `.area_m2`,
+    `.attributes`, `.step_id`."""
+
+    _REPR_KEYS = ("class", "confidence", "area_m2")
+
+
+class LinearFeature(_ResultRow):
+    """A line, for example a wheel rut: `.class_`, `.confidence`, `.geom`, `.measurement` with
+    `.measurement_unit`, `.attributes`, `.step_id`."""
+
+    _REPR_KEYS = ("class", "measurement", "measurement_unit")
+
+
+class TreeRecord(_ResultRow):
+    """One tree of a tree inventory: `.species`, `.dbh_cm`, `.height_m`, `.volume_m3`, `.geom` (may be None),
+    `.attributes`, `.step_id`."""
+
+    _REPR_KEYS = ("species", "dbh_cm", "height_m")
+
+
+# table name -> (route, row view). The names are the keys of a batch's `results`.
+RESULT_TABLES: dict[str, tuple[str, type]] = {
+    "detections": ("detections", Detection),
+    "segments": ("segments", Segment),
+    "linear_features": ("linear-features", LinearFeature),
+    "tree_inventory": ("tree-inventory", TreeRecord),
+}
+RESULT_PAGE_SIZE = 1000  # the API's maximum for the result tables
+RATE_LIMIT_ATTEMPTS = 5
 
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -785,9 +840,124 @@ class Client:
                 break
         return written
 
+    # -- typed results ---------------------------------------------------------
+
+    @staticmethod
+    def _result_params(filters: dict[str, Any]) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        for key, value in filters.items():
+            if value is None:
+                continue
+            if key == "class_":
+                key = "class"
+            if key == "bbox" and not isinstance(value, str):
+                value = ",".join(str(v) for v in value)
+            params[key] = value
+        return params
+
+    def _result_page(self, batch_id: str, table: str, filters: dict[str, Any]) -> tuple[list[Any], str | None]:
+        if table not in RESULT_TABLES:
+            raise ValueError(f"table must be one of {', '.join(RESULT_TABLES)}, not {table!r}")
+        route, view = RESULT_TABLES[table]
+        page = self._request_page(f"/v1/batches/{batch_id}/{route}", self._result_params(filters))
+        return [view(row) for row in page["items"]], page["next_cursor"]
+
+    def list_detections(
+        self, batch_id: str, step_id: str | None = None, class_: str | None = None,
+        confidence_min: float | None = None, bbox: Any = None, limit: int = RESULT_PAGE_SIZE,
+        cursor: str | None = None,
+    ) -> tuple[list[Detection], str | None]:
+        """One page of a batch's detections, newest first. Returns (rows, next_cursor), like list_batches().
+        `class_` keeps one class, `confidence_min` drops weaker ones, `bbox` is (min_lon, min_lat, max_lon, max_lat)
+        or the same as a "minLon,minLat,maxLon,maxLat" string, `step_id` one step of a multi-step batch."""
+        return self._result_page(batch_id, "detections", dict(
+            step_id=step_id, class_=class_, confidence_min=confidence_min, bbox=bbox, limit=limit, cursor=cursor))
+
+    def list_segments(
+        self, batch_id: str, step_id: str | None = None, class_: str | None = None,
+        confidence_min: float | None = None, bbox: Any = None, limit: int = RESULT_PAGE_SIZE,
+        cursor: str | None = None,
+    ) -> tuple[list[Segment], str | None]:
+        """One page of a batch's segments (for example tree crowns); filters as list_detections()."""
+        return self._result_page(batch_id, "segments", dict(
+            step_id=step_id, class_=class_, confidence_min=confidence_min, bbox=bbox, limit=limit, cursor=cursor))
+
+    def list_linear_features(
+        self, batch_id: str, step_id: str | None = None, class_: str | None = None,
+        confidence_min: float | None = None, bbox: Any = None, limit: int = RESULT_PAGE_SIZE,
+        cursor: str | None = None,
+    ) -> tuple[list[LinearFeature], str | None]:
+        """One page of a batch's linear features (for example wheel ruts); filters as list_detections()."""
+        return self._result_page(batch_id, "linear_features", dict(
+            step_id=step_id, class_=class_, confidence_min=confidence_min, bbox=bbox, limit=limit, cursor=cursor))
+
+    def list_tree_inventory(
+        self, batch_id: str, step_id: str | None = None, species: str | None = None,
+        dbh_min: float | None = None, dbh_max: float | None = None, limit: int = RESULT_PAGE_SIZE,
+        cursor: str | None = None,
+    ) -> tuple[list[TreeRecord], str | None]:
+        """One page of a batch's tree inventory. `species`, `dbh_min`/`dbh_max` (cm) filter it."""
+        return self._result_page(batch_id, "tree_inventory", dict(
+            step_id=step_id, species=species, dbh_min=dbh_min, dbh_max=dbh_max, limit=limit, cursor=cursor))
+
+    def iter_results(self, batch_id: str, table: str, **filters: Any) -> Iterator[Any]:
+        """Every row of one result table, page by page (1000 rows a page). `table` is "detections", "segments",
+        "linear_features" or "tree_inventory"; `filters` are those of the matching list_...() method."""
+        filters.pop("cursor", None)
+        filters.setdefault("limit", RESULT_PAGE_SIZE)
+        cursor = None
+        while True:
+            rows, cursor = self._result_page(batch_id, table, {**filters, "cursor": cursor})
+            yield from rows
+            if not cursor:
+                return
+
+    def get_results(self, batch_id: str, table: str, **filters: Any) -> list[Any]:
+        """All rows of one result table as a list (see iter_results())."""
+        return list(self.iter_results(batch_id, table, **filters))
+
+    def results_geojson(self, batch_id: str, table: str, **filters: Any) -> dict[str, Any]:
+        """One result table as a GeoJSON FeatureCollection (WGS84): each row's `geom` is the geometry, everything
+        else its properties. With geopandas: `geopandas.GeoDataFrame.from_features(fc["features"], crs="EPSG:4326")`."""
+        features = []
+        for row in self.iter_results(batch_id, table, **filters):
+            properties = {k: v for k, v in row.items() if k != "geom"}
+            features.append({"type": "Feature", "id": row.get("id"), "geometry": row.get("geom"),
+                             "properties": properties})
+        return {"type": "FeatureCollection", "features": features}
+
+    def save_results(
+        self, batch_id: str, dest_dir: str | os.PathLike[str], tables: list[str] | None = None
+    ) -> list[str]:
+        """Writes `<table>.geojson` into dest_dir for each result table the batch has rows in (or only `tables`),
+        returns the paths written. Result files (orthophotos, point clouds) come from download_artifacts()."""
+        summary = self.get_batch(batch_id).get("results") or {}
+        wanted = tables if tables is not None else [t for t in RESULT_TABLES if (summary.get(t) or {}).get("count")]
+        for table in wanted:
+            if table not in RESULT_TABLES:
+                raise ValueError(f"table must be one of {', '.join(RESULT_TABLES)}, not {table!r}")
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        written = []
+        for table in wanted:
+            path = dest / f"{table}.geojson"
+            with path.open("w") as f:
+                json.dump(self.results_geojson(batch_id, table), f)
+            written.append(str(path))
+        return written
+
     def _request_page(self, path: str, params: dict[str, Any] | None) -> dict[str, Any]:
         headers = {"X-Api-Key": self.api_key}
-        resp = self._session.get(self._url(path), headers=headers, params=params)
+        for attempt in range(1, RATE_LIMIT_ATTEMPTS + 1):
+            resp = self._session.get(self._url(path), headers=headers, params=params)
+            if resp.status_code != 429 or attempt == RATE_LIMIT_ATTEMPTS:
+                break
+            # The per-key rate limit (paging a large result table can reach it): wait as told, then ask again.
+            try:
+                wait_s = float(resp.headers.get("Retry-After", 1))
+            except (TypeError, ValueError):
+                wait_s = 1.0
+            time.sleep(min(max(wait_s, 0.5), 60))
         body = resp.json()
         if not resp.ok or body.get("error"):
             err = body.get("error") or {}

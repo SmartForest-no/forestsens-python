@@ -1,7 +1,7 @@
 [project]
 name = "forestsens"
-version = "3.4.0"
-description = "Python client for the ForestSens API (datasets, projects, batches, downloads)"
+version = "3.5.0"
+description = "Python client for the ForestSens API (datasets, projects, batches, downloads, typed results)"
 readme = "Readme.md"
 license = { text = "MIT" }
 authors = [{ name = "Johannes Rahlf", email = "johannes.rahlf@nibio.no" }]

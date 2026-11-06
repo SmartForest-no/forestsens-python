@@ -96,6 +96,20 @@ Client.run(
     # in one call, for the common single-input-slot case.
 
 Client.download_artifacts(batch_id: str, dest_dir: str | os.PathLike) -> list[str]
+
+# Typed result tables (rows are dict subclasses: Detection, Segment, LinearFeature, TreeRecord).
+# table: "detections" | "segments" | "linear_features" | "tree_inventory"
+Client.list_detections(batch_id, step_id=None, class_=None, confidence_min=None, bbox=None,
+                       limit=1000, cursor=None) -> tuple[list[Detection], str | None]
+Client.list_segments(...same filters...) -> tuple[list[Segment], str | None]          # e.g. tree crowns
+Client.list_linear_features(...same filters...) -> tuple[list[LinearFeature], str | None]  # e.g. wheel ruts
+Client.list_tree_inventory(batch_id, step_id=None, species=None, dbh_min=None, dbh_max=None,
+                           limit=1000, cursor=None) -> tuple[list[TreeRecord], str | None]
+Client.iter_results(batch_id, table, **filters) -> Iterator[row]   # all pages
+Client.get_results(batch_id, table, **filters) -> list[row]
+Client.results_geojson(batch_id, table, **filters) -> dict          # GeoJSON FeatureCollection, WGS84
+Client.save_results(batch_id, dest_dir, tables=None) -> list[str]  # <table>.geojson per table with rows
+# bbox = (min_lon, min_lat, max_lon, max_lat) or "minLon,minLat,maxLon,maxLat"
 ```
 
 ## Pipeline and Batch objects
@@ -133,9 +147,12 @@ forestsens.BatchFailedError(batch: dict)  # subclass of ForestSensAPIError, code
 - `Batch.status` is `"queued"` / `"running"` / `"complete"` / `"failed"` / `"cancelled"` -- never `"done"`; treat
   an unknown value as "not finished". `gateway_host` may be given with or without `https://`.
 - `sens` is `"drone"` (pipelines expect `.jpg` input) or `"point"` (pipelines expect `.las`/`.laz`).
-- This client covers uploads, datasets, projects and sharing, batches and artifact download -- no API-key
-  management, no typed result tables (detections/segments/tree inventory). Those are reachable directly over
-  HTTP with the same `X-Api-Key` header against `/v1-key/...` but aren't wrapped by this package.
+- This client covers uploads, datasets, projects and sharing, batches, artifact download and the typed result
+  tables -- no API-key management (reachable directly over HTTP with the same `X-Api-Key` header against
+  `/v1-key/...`).
+- Result rows: `class` is a Python keyword, so use `row["class"]` or `row.class_`. `batch["results"]` says which
+  tables a batch has (`{count, href}` or None). Big tables are paged (1000 rows); `get_results()` follows all pages
+  and waits out a `429 rate_limited`.
 - Error codes you will meet: `unauthenticated` (401), `forbidden` (403), `not_found` (404),
   `storage_limit_exceeded` (413, retrying does not help: delete or split data, or ask for a higher limit),
   `validation_error` (422; completing an upload with missing files lists them in `.details`),

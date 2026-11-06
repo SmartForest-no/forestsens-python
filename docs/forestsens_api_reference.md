@@ -62,3 +62,12 @@ each with `status`/`error`/`log_tail`), and a `results` summary of what's availa
 Cursor-paginated list of output files. Each artifact carries a live `download_url` (a fresh
 pre-authenticated Object Storage URL, `Accept-Ranges: bytes`) -- no separate "generate a download
 link" call needed.
+
+## `GET /v1/batches/{batch_id}/detections | segments | linear-features | tree-inventory`
+
+The typed result tables (`list_detections()` ... `list_tree_inventory()`, `get_results()`, `results_geojson()`,
+`save_results()`). Cursor-paginated, newest first, `limit` up to 1000. Filters: `step_id`, `class`, `confidence_min`,
+`bbox=minLon,minLat,maxLon,maxLat` (tree inventory: `step_id`, `species`, `dbh_min`, `dbh_max`). Each row has `id`,
+`step_id`, `geom` (GeoJSON geometry, WGS84; may be null for tree inventory), `attributes`, `created_at`, plus
+`class`/`confidence` and per table `box_width`/`box_height`, `area_m2`, `measurement`/`measurement_unit`, or
+`species`/`dbh_cm`/`height_m`/`volume_m3`. A batch's `results` names which tables it has (`{count, href}`).

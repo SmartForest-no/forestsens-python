@@ -1,6 +1,6 @@
 [project]
 name = "forestsens"
-version = "3.5.0"
+version = "3.5.1"
 description = "Python client for the ForestSens API (datasets, projects, batches, downloads, typed results)"
 readme = "Readme.md"
 license = { text = "MIT" }

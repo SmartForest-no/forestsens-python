@@ -96,6 +96,8 @@ Client.run(
     # in one call, for the common single-input-slot case.
 
 Client.download_artifacts(batch_id: str, dest_dir: str | os.PathLike) -> list[str]
+    # Files: <output_type>_<id8>.<format>. A folder result's download_url is an API path, resolved through the
+    # API (v3.5.1+); the file you get is then the folder's results.zip, still named by format.
 
 # Typed result tables (rows are dict subclasses: Detection, Segment, LinearFeature, TreeRecord).
 # table: "detections" | "segments" | "linear_features" | "tree_inventory"

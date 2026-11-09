@@ -814,11 +814,12 @@ class Client:
 
     def download_artifacts(self, batch_id: str, dest_dir: str | os.PathLike[str]) -> list[str]:
         """Downloads every artifact produced by a batch into dest_dir,
-        returns the local paths written. Each artifact's download_url is
-        already a live pre-authenticated Object Storage URL (minted
-        fresh per call) -- no separate "generate a download link" step.
-        ArtifactOut carries no filename, so one is derived from
-        output_type + format + a short id fragment.
+        returns the local paths written. An artifact's download_url is
+        either a live pre-authenticated Object Storage URL, or an API
+        path (/v1/batches/.../download-all) that answers with one; both
+        work. ArtifactOut carries no filename, so one is derived from
+        output_type + format + a short id fragment (unchanged; the
+        platform's downloads-revision gives files their real names).
         """
         dest = Path(dest_dir)
         dest.mkdir(parents=True, exist_ok=True)
@@ -833,7 +834,7 @@ class Client:
                 # as-is rather than guessed-mapped to a conventional
                 # extension, so this never silently mislabels a file.
                 local_path = dest / f"{artifact['output_type']}_{artifact['id'][:8]}.{artifact['format']}"
-                self._download_one(artifact["download_url"], local_path)
+                self._download_one(self._artifact_url(artifact), local_path)
                 written.append(str(local_path))
             cursor = page["next_cursor"]
             if not cursor:
@@ -969,7 +970,26 @@ class Client:
             "next_cursor": (body.get("meta", {}).get("pagination") or {}).get("next_cursor"),
         }
 
+    def _artifact_url(self, artifact: dict[str, Any]) -> str:
+        """The artifact's pre-authenticated download link. Older servers put it in download_url directly; newer ones
+        give an API path there, which answers (with the API key) {"download_url": <link>}."""
+        url = artifact.get("download_url")
+        if not url:
+            raise ForestSensAPIError(200, "no_download_url", f"artifact {artifact.get('id')} has no download_url")
+        if not url.startswith("/"):
+            return url
+        if url.startswith("/v1-key/"):
+            url = "/v1/" + url[len("/v1-key/"):]
+        if not url.startswith("/v1/"):
+            raise ForestSensAPIError(200, "no_download_url", f"unexpected download path for artifact {artifact.get('id')}: {url!r}")
+        reply = self._request("GET", url)
+        link = reply.get("download_url") if isinstance(reply, dict) else None
+        if not link or link.startswith("/"):
+            raise ForestSensAPIError(200, "no_download_url", f"no download link for artifact {artifact.get('id')}: {reply!r}")
+        return link
+
     def _download_one(self, url: str, local_path: Path) -> None:
+        # A pre-authenticated link: requests.get, not the session, so no API key is ever sent to Object Storage.
         with requests.get(url, stream=True) as resp:
             resp.raise_for_status()
             with local_path.open("wb") as f:

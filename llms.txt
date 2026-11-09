@@ -57,8 +57,19 @@ Client.set_upload_shares(upload_id, users) -> list[Member]
     # REPLACES the list. users: user ids, e-mail addresses or Members. Only for private datasets.
     # Do not change visibility or share data unless the person asks.
 
-Client.create_batch(pipeline_id: str, inputs: list[dict]) -> Batch
+Client.create_batch(pipeline_id: str, inputs: list[dict], *, use_latest_version=False, name=None,
+                    wait_for_slot=False, slot_timeout=None) -> Batch
     # inputs: [{"slot": "input", "upload_id": upload_id}]
+    # A user may have 20 batches queued or running (an account 50); one more -> 429 quota_exceeded.
+    # wait_for_slot=True waits (Retry-After) and tries again instead of raising.
+
+Client.run_many(jobs, *, max_active=4, poll_interval=10.0, dest_dir=None, use_latest=False,
+                stop_on_failure=False, on_progress=None) -> list[RunResult]
+    # THE way to run many batches: at most max_active (1..20) in flight, next starts when one ends.
+    # job: {"pipeline": Pipeline|id, "upload_id"|"inputs"|"paths": ..., "name"?: str, "slot"?: "input"}
+    # RunResult: .status ("complete"|"failed"|"cancelled"|"error"), .batch_id, .error, .paths, .job, .batch
+    # on_progress(summary): {"total","done","failed","running","waiting","result"}
+    # Never write a loop of create_batch() for many datasets.
 
 Client.get_batch(batch_id: str) -> Batch
 
@@ -74,7 +85,8 @@ Client.wait_for_batch(
     timeout: float | None = None,
     on_progress: Callable[[Batch], None] | None = None,
 ) -> Batch
-    # Polls until status == "complete" (returns) or "failed" (raises BatchFailedError).
+    # Polls until status == "complete" (returns) or "failed"/"cancelled" (raises BatchFailedError,
+    # code "batch_failed" / "batch_cancelled").
     # on_progress is called once per status change, e.g. on_progress=print.
     # Raises TimeoutError if timeout is set and exceeded.
 

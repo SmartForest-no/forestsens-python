@@ -136,11 +136,12 @@ client = Client()  # picks up the env vars above
 | `list_pipelines(sens=None, include_retired=False, include_drafts=False)` | `list[Pipeline]` | Lists available pipelines (the newest version of each), optionally filtered by sens (`"drone"`, `"point"`, ...); `include_retired=True` adds older versions, `include_drafts=True` your account's drafts. `Pipeline` is a real `dict` (`pipeline["id"]` works) with a friendly `.id`/`.name`/`.description` and a clean repr -- printing one shows just its name, not the full internal graph/id payload. |
 | `find_pipeline(name, sens=None)` | `Pipeline` | Looks up a single pipeline by its exact display name (e.g. copied from the web UI) instead of filtering/indexing `list_pipelines()` yourself. Raises `LookupError` (with the real available names) if there's no match, or more than one. |
 | `upload_files(paths, name=None, on_progress=None, project=None, private=False, concurrency=4)` | `str` (upload id) | Uploads a file, a folder (its top-level files, not recursive), or a list mixing either, as a single dataset. Files up to 16 MB are sent `concurrency` at a time (4 by default, like the web app; `1` sends them one after another); larger files follow in 16 MB chunks. `on_progress`, if given, is called as `on_progress(filename, loaded_bytes, total_bytes)` while each file uploads (see below). `project` (a `Project`, id or exact name) puts it in a project; `private=True` makes it visible only to you, account admins and members you share it with. |
-| `create_batch(pipeline_id, inputs, use_latest_version=False)` | `Batch` | Starts a pipeline run. `inputs` is `[{"slot": str, "upload_id": str}, ...]`. Warns (`ForestSensNewerVersionWarning`) when `pipeline_id` is an older version; `use_latest_version=True` runs the newest one instead. `Batch` is the same friendly-`dict` treatment as `Pipeline` (`.id`/`.status`, `batch["status"]` both work). |
+| `create_batch(pipeline_id, inputs, use_latest_version=False, name=None, wait_for_slot=False, slot_timeout=None)` | `Batch` | Starts a pipeline run. `inputs` is `[{"slot": str, "upload_id": str}, ...]`. Warns (`ForestSensNewerVersionWarning`) when `pipeline_id` is an older version; `use_latest_version=True` runs the newest one instead. `Batch` is the same friendly-`dict` treatment as `Pipeline` (`.id`/`.status`, `batch["status"]` both work). `wait_for_slot=True` waits for a free batch slot instead of raising `429 quota_exceeded` (20 queued or running batches per user). For many batches use `run_many()`. |
 | `get_batch(batch_id)` | `Batch` | Fetches a batch's current status/detail. |
 | `list_batches(status=None, upload_id=None, created_by=None, sort="created", direction="desc", limit=20, cursor=None)` | `(list[Batch], next_cursor)` | One page of batches, newest first by default. No pipeline filter -- filter the returned batches' `pipeline_id` yourself if you only want one pipeline's. |
-| `wait_for_batch(batch_id, poll_interval=5.0, timeout=None, on_progress=None)` | `Batch` | Polls until the batch reaches `"complete"` or `"failed"`. Raises `BatchFailedError` on failure. `on_progress`, if given, is called once per status change -- pass `on_progress=print` for a one-line log. |
+| `wait_for_batch(batch_id, poll_interval=5.0, timeout=None, on_progress=None)` | `Batch` | Polls until the batch reaches `"complete"`, `"failed"` or `"cancelled"`. Raises `BatchFailedError` on failure or cancellation (`code` `"batch_failed"` / `"batch_cancelled"`). `on_progress`, if given, is called once per status change -- pass `on_progress=print` for a one-line log. |
 | `run(pipeline, paths, dest_dir, slot="input", name=None, poll_interval=5.0, timeout=None, on_progress=None, on_upload_progress=None, project=None, private=False, use_latest=False)` | `list[str]` (local paths) | The common single-input case in one call: upload -> create a batch -> wait -> download. `pipeline` can be a `Pipeline` or a bare id string. `use_latest=True` follows newer versions of the pipeline. |
+| `run_many(jobs, max_active=4, poll_interval=10.0, dest_dir=None, use_latest=False, stop_on_failure=False, on_progress=None)` | `list[RunResult]` | Many batches, at most `max_active` at once; the next starts when one ends. Each job is `{"pipeline", "upload_id" or "inputs" or "paths", "name"?}`. A `RunResult` has `.status` (`complete`/`failed`/`cancelled`/`error`), `.batch_id`, `.error`, `.paths`. See "Many datasets" below. |
 | `download_artifacts(batch_id, dest_dir)` | `list[str]` (local paths) | Downloads every artifact the batch produced, as `<output_type>_<id8>.<format>`. Since v3.5.1 this also works for results that are a folder on the server (the API gives `download_url` as a path; you get the folder's `results.zip`). |
 | `list_detections(batch_id, step_id=None, class_=None, confidence_min=None, bbox=None, limit=1000, cursor=None)` | `(list[Detection], next_cursor)` | One page of a batch's detections. `list_segments(...)` (e.g. tree crowns) and `list_linear_features(...)` (e.g. wheel ruts) take the same filters. `bbox` is `(min_lon, min_lat, max_lon, max_lat)`. |
 | `list_tree_inventory(batch_id, step_id=None, species=None, dbh_min=None, dbh_max=None, limit=1000, cursor=None)` | `(list[TreeRecord], next_cursor)` | One page of a batch's tree inventory. |
@@ -171,6 +172,27 @@ client.upload_files("path/to/your/photos", on_progress=lambda name, done, total:
 With several files uploading at once (the default), the calls for different files interleave, one call at a time.
 It is called with `0` when a file starts, about once per percent while it uploads (once per chunk for large files),
 and with `total` when it is done. After a retry, `loaded_bytes` can start over from a lower value.
+
+**Many datasets.** To run a pipeline on many datasets, use `run_many()`: it keeps a few batches in flight and starts
+the next one whenever one finishes. Do not loop over `create_batch()`: that sends everything at once, is refused
+after 20 batches (each user may have 20 queued or running) and starts many machines at the same moment.
+
+```python
+from pathlib import Path
+
+pipeline = client.find_pipeline("Orthophoto (fast)")
+jobs = [{"pipeline": pipeline, "paths": folder, "name": folder.name} for folder in Path("flights").iterdir() if folder.is_dir()]
+results = client.run_many(jobs, max_active=3, dest_dir="results",
+                          on_progress=lambda s: print(f"{s['done']}/{s['total']} done, {s['failed']} failed, "
+                                                      f"{s['running']} running"))
+for r in results:
+    print(r.job["name"], r.status, r.batch_id, r.error or "")
+```
+
+A job can also name a dataset already in ForestSens (`"upload_id"`) or several inputs (`"inputs"`). A failed batch does
+not stop the others (`stop_on_failure=True` does); when your batch slots are full, a job waits and is tried again.
+Each finished batch's files go to `dest_dir/<name>/`. Ctrl-C stops starting new jobs; the ones already started keep
+running on the server (their ids are printed). The full example is `examples/example_many.py`.
 
 **Projects and private datasets.**
 

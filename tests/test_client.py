@@ -787,14 +787,13 @@ def test_download_artifacts_resolves_a_relative_download_url_and_sends_no_key_to
     # ... and the link it gives is fetched plainly, without the key.
     assert mock_get.call_args.args == (par,)
     assert "headers" not in mock_get.call_args.kwargs
-    # The "laz" artifact is a zip: named for what it is.
-    local_path = tmp_path / "enriched_point_cloud_artifact.laz.zip"
+    # Saved under the usual name (real file names come with the platform's downloads-revision).
+    local_path = tmp_path / "enriched_point_cloud_artifact.laz"
     assert written == [str(local_path)]
     assert local_path.read_bytes() == zipped
-    assert not (tmp_path / "enriched_point_cloud_artifact.laz").exists()
 
 
-def test_download_artifacts_relative_url_in_an_envelope_and_a_plain_laz_keeps_its_name(tmp_path):
+def test_download_artifacts_resolves_a_relative_url_given_in_an_envelope(tmp_path):
     client = make_client()
     artifacts = [{"id": "artifact-1234abcd", "output_type": "enriched_point_cloud", "format": "laz",
                   "download_url": "/v1/batches/b/artifacts/a/download-all"}]
@@ -820,6 +819,17 @@ def test_download_artifacts_raises_when_the_relative_url_gives_no_link(tmp_path)
         with pytest.raises(ForestSensAPIError) as exc:
             client.download_artifacts("batch-1", tmp_path)
     assert exc.value.code == "no_download_url"
+    mock_get.assert_not_called()
+
+
+def test_download_artifacts_refuses_a_path_outside_the_api(tmp_path):
+    client = make_client()
+    artifacts = [{"id": "a1", "output_type": "x", "format": "laz", "download_url": "/elsewhere/a1"}]
+    with patch("requests.Session.get") as mock_session_get, patch("requests.get") as mock_get:
+        mock_session_get.return_value = envelope_response(data=artifacts, pagination={"next_cursor": None})
+        with pytest.raises(ForestSensAPIError) as exc:
+            client.download_artifacts("batch-1", tmp_path)
+    assert exc.value.code == "no_download_url" and "/elsewhere/a1" in exc.value.message
     mock_get.assert_not_called()
 
 

@@ -64,7 +64,7 @@ pre-authenticated Object Storage URL (`Accept-Ranges: bytes`), or an API path su
 `/v1/batches/{batch_id}/artifacts/{artifact_id}/download-all`. A `GET` on that path (with the API key, through
 `/v1-key/`) answers `{"download_url": "<pre-authenticated URL>"}`. Fetch the pre-authenticated URL without the API
 key. `download_artifacts()` handles both forms (v3.5.1+). The file can be a zip even when `format` says otherwise
-(a `laz` result arrives as `results.zip` with the `.laz` inside).
+(a folder result arrives as its `results.zip`); the client still names it by `format`.
 
 ## `GET /v1/batches/{batch_id}/detections | segments | linear-features | tree-inventory`
 

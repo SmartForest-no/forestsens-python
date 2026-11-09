@@ -743,6 +743,86 @@ def test_download_artifacts_streams_each_artifact_to_dest_dir(tmp_path):
     assert local_path.read_bytes() == b"filebytes"
 
 
+def _zip_bytes(name="cloud.laz", data=b"LASF"):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(name, data)
+    return buf.getvalue()
+
+
+def _stream_response(body):
+    resp = MagicMock()
+    resp.__enter__.return_value = resp
+    resp.raise_for_status.return_value = None
+    resp.iter_content.return_value = [body]
+    return resp
+
+
+def test_download_artifacts_resolves_a_relative_download_url_and_sends_no_key_to_storage(tmp_path):
+    client = make_client()
+    path = "/v1/batches/batch-1/artifacts/artifact-1234abcd/download-all"
+    artifacts = [{"id": "artifact-1234abcd", "output_type": "enriched_point_cloud", "format": "laz",
+                  "download_url": path, "download_all": path}]
+    par = "https://objectstorage.eu-frankfurt-1.oraclecloud.com/p/tok/n/ns/b/bk/o/results.zip"
+    zipped = _zip_bytes()
+
+    with patch("requests.Session.get") as mock_session_get, patch(
+        "requests.Session.request"
+    ) as mock_request, patch("requests.get") as mock_get:
+        mock_session_get.return_value = envelope_response(data=artifacts, pagination={"next_cursor": None})
+        resolve = MagicMock(status_code=200, ok=True)
+        resolve.json.return_value = {"download_url": par}   # this route answers without the envelope
+        mock_request.return_value = resolve
+        mock_get.return_value = _stream_response(zipped)
+
+        written = client.download_artifacts("batch-1", tmp_path)
+
+    # The path is asked through the API (key, /v1-key/ route) ...
+    method, url = mock_request.call_args.args
+    assert (method, url) == ("GET", "https://example.apigateway.oci.customer-oci.com/v1-key/batches/batch-1/artifacts/artifact-1234abcd/download-all")
+    assert mock_request.call_args.kwargs["headers"]["X-Api-Key"] == "fs_test"
+    # ... and the link it gives is fetched plainly, without the key.
+    assert mock_get.call_args.args == (par,)
+    assert "headers" not in mock_get.call_args.kwargs
+    # The "laz" artifact is a zip: named for what it is.
+    local_path = tmp_path / "enriched_point_cloud_artifact.laz.zip"
+    assert written == [str(local_path)]
+    assert local_path.read_bytes() == zipped
+    assert not (tmp_path / "enriched_point_cloud_artifact.laz").exists()
+
+
+def test_download_artifacts_relative_url_in_an_envelope_and_a_plain_laz_keeps_its_name(tmp_path):
+    client = make_client()
+    artifacts = [{"id": "artifact-1234abcd", "output_type": "enriched_point_cloud", "format": "laz",
+                  "download_url": "/v1/batches/b/artifacts/a/download-all"}]
+    with patch("requests.Session.get") as mock_session_get, patch(
+        "requests.Session.request"
+    ) as mock_request, patch("requests.get") as mock_get:
+        mock_session_get.return_value = envelope_response(data=artifacts, pagination={"next_cursor": None})
+        mock_request.return_value = envelope_response(data={"download_url": "https://par.example/x.laz"})
+        mock_get.return_value = _stream_response(b"LASF....")
+        written = client.download_artifacts("batch-1", tmp_path)
+    assert mock_get.call_args.args == ("https://par.example/x.laz",)
+    assert written == [str(tmp_path / "enriched_point_cloud_artifact.laz")]
+
+
+def test_download_artifacts_raises_when_the_relative_url_gives_no_link(tmp_path):
+    client = make_client()
+    artifacts = [{"id": "a1", "output_type": "x", "format": "laz", "download_url": "/v1/batches/b/artifacts/a1/download-all"}]
+    with patch("requests.Session.get") as mock_session_get, patch(
+        "requests.Session.request"
+    ) as mock_request, patch("requests.get") as mock_get:
+        mock_session_get.return_value = envelope_response(data=artifacts, pagination={"next_cursor": None})
+        mock_request.return_value = envelope_response(data={})
+        with pytest.raises(ForestSensAPIError) as exc:
+            client.download_artifacts("batch-1", tmp_path)
+    assert exc.value.code == "no_download_url"
+    mock_get.assert_not_called()
+
+
 def test_gateway_host_may_be_given_with_a_scheme_and_trailing_slash():
     for given in ("h.example.com", "https://h.example.com", "https://h.example.com/", "HTTPS://h.example.com/"):
         client = Client(gateway_host=given, api_key="fs_x")

@@ -35,6 +35,11 @@ MULTIPART_CHUNK_SIZE_BYTES = 16 * 1024 * 1024
 MAX_ATTEMPTS = 3
 # Files uploaded at the same time by upload_files(), the same number the web app uses (frontend MAX_CONCURRENT_UPLOADS).
 DEFAULT_UPLOAD_CONCURRENCY = 4
+# run_many(): batches kept in flight by default, and the server's own cap (20 queued or running per user).
+DEFAULT_MAX_ACTIVE = 4
+MAX_ACTIVE_LIMIT = 20
+# Waiting for a free batch slot when the server sends no Retry-After.
+DEFAULT_SLOT_WAIT_SECONDS = 60.0
 DEFAULT_CONFIG_PATH = Path.home() / ".forestsens" / "config.json"
 
 
@@ -91,6 +96,22 @@ class Batch(dict):
 
     def __str__(self) -> str:
         return f"{self.get('id')} ({self.get('status')})"
+
+
+class RunResult(dict):
+    """One job of run_many(): `.index`, `.job` (the dict you passed), `.batch_id`, `.status` ("complete", "failed",
+    "cancelled" or "error" when it could not be uploaded or started), `.error` (a message), `.batch` (last seen),
+    `.paths` (downloaded files, with dest_dir). A real dict, with attribute access."""
+
+    def __getattr__(self, key: str) -> Any:
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __repr__(self) -> str:
+        label = self.get("job", {}).get("name") or self.get("batch_id") or f"job {self.get('index')}"
+        return f"RunResult({label!r}, status={self.get('status')!r})"
 
 
 class _View(dict):
@@ -191,6 +212,15 @@ RESULT_PAGE_SIZE = 1000  # the API's maximum for the result tables
 RATE_LIMIT_ATTEMPTS = 5
 
 
+def _retry_after(resp: Any) -> float | None:
+    """The `Retry-After` seconds of a response, or None (missing, not a number, or a test double)."""
+    try:
+        value = resp.headers.get("Retry-After")
+        return float(value) if value is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _KEEP: Any = object()  # "leave unchanged" marker for update_upload(project=...)
 
@@ -280,11 +310,12 @@ class Client:
             body = None
         error = body.get("error") if isinstance(body, dict) else None
         if not resp.ok or error:
+            retry_after = _retry_after(resp)
             if error:
                 raise ForestSensAPIError(
-                    resp.status_code, error["code"], error["message"], error.get("details")
+                    resp.status_code, error["code"], error["message"], error.get("details"), retry_after=retry_after
                 )
-            raise ForestSensAPIError(resp.status_code, "unknown_error", f"HTTP {resp.status_code}")
+            raise ForestSensAPIError(resp.status_code, "unknown_error", f"HTTP {resp.status_code}", retry_after=retry_after)
         return body["data"] if isinstance(body, dict) and "data" in body else body
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -661,7 +692,14 @@ class Client:
     # -- batches ------------------------------------------------------------
 
     def create_batch(
-        self, pipeline_id: str, inputs: list[dict[str, Any]], *, use_latest_version: bool = False
+        self,
+        pipeline_id: str,
+        inputs: list[dict[str, Any]],
+        *,
+        use_latest_version: bool = False,
+        name: str | None = None,
+        wait_for_slot: bool = False,
+        slot_timeout: float | None = None,
     ) -> Batch:
         """inputs: [{"slot": str, "upload_id": str}, ...] -- see
         list_pipelines()'s returned graph for a given pipeline's expected
@@ -671,11 +709,30 @@ class Client:
         runs exactly that version, and a ForestSensNewerVersionWarning says a newer one exists.
         `use_latest_version=True` runs the newest version whatever id is given. The returned batch's
         `pipeline_id` is the version that runs.
+
+        Each user may have 20 batches queued or running (an account 50); one more is refused with
+        `429 quota_exceeded`. `wait_for_slot=True` waits the seconds the server names and tries again until a slot
+        is free (or `slot_timeout` seconds have passed). To run many batches, use run_many(), which keeps only a
+        few in flight. `name` labels the batch.
         """
         body: dict[str, Any] = {"pipeline_id": pipeline_id, "inputs": inputs}
         if use_latest_version:
             body["use_latest_version"] = True
-        batch = Batch(self._post("/v1/batches", body))
+        if name:
+            body["name"] = name
+        deadline = time.monotonic() + slot_timeout if slot_timeout is not None else None
+        while True:
+            try:
+                created = self._post("/v1/batches", body)
+                break
+            except ForestSensAPIError as exc:
+                if not wait_for_slot or exc.status != 429 or exc.code != "quota_exceeded":
+                    raise
+                wait_s = exc.retry_after if exc.retry_after is not None else DEFAULT_SLOT_WAIT_SECONDS
+                if deadline is not None and time.monotonic() + wait_s > deadline:
+                    raise
+                time.sleep(max(wait_s, 1.0))
+        batch = Batch(created)
         newer = batch.get("newer_pipeline_version")
         if newer:
             warnings.warn(
@@ -729,9 +786,9 @@ class Client:
         timeout: float | None = None,
         on_progress: Callable[[Batch], None] | None = None,
     ) -> Batch:
-        """Polls until the batch reaches status "complete" or "failed".
+        """Polls until the batch reaches status "complete", "failed" or "cancelled".
         Raises BatchFailedError (carrying the full batch dict, including
-        per-step errors/log tails) on failure -- the "one call to get to
+        per-step errors/log tails) on failure or cancellation (code "batch_cancelled") -- the "one call to get to
         a finished batch" convenience this kind of client should have.
 
         `on_progress`, if given, is called once each time the batch's
@@ -758,7 +815,7 @@ class Client:
                 last_status = batch["status"]
             if batch["status"] == "complete":
                 return batch
-            if batch["status"] == "failed":
+            if batch["status"] in ("failed", "cancelled"):
                 raise BatchFailedError(batch)
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"batch {batch_id} did not finish within {timeout}s")
@@ -809,6 +866,141 @@ class Client:
             batch["id"], poll_interval=poll_interval, timeout=timeout, on_progress=on_progress
         )
         return self.download_artifacts(batch["id"], dest_dir)
+
+    def run_many(
+        self,
+        jobs: Any,
+        *,
+        max_active: int = DEFAULT_MAX_ACTIVE,
+        poll_interval: float = 10.0,
+        dest_dir: str | os.PathLike[str] | None = None,
+        use_latest: bool = False,
+        stop_on_failure: bool = False,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[RunResult]:
+        """Runs many batches a few at a time: at most `max_active` of them are queued or running at once; when one
+        ends, the next is started. Use this instead of a loop of create_batch(), which sends everything at once,
+        is refused after 20 (the per-user cap) and starts many machines at the same moment.
+
+        `jobs`: dicts, each with "pipeline" (a Pipeline or an id) and one of "upload_id" (a dataset in ForestSens),
+        "inputs" ([{"slot", "upload_id"}]) or "paths" (local files or a folder, uploaded just before the job
+        starts); optional "name" (a label: the batch's name, the dataset's name with "paths", and the download
+        folder) and "slot" (default "input").
+
+        A batch that fails or is cancelled does not stop the others (`stop_on_failure=True` starts no new ones
+        after a failure; the running ones are still waited for). A job that cannot be uploaded or started gets
+        status "error". When the server says the user's batch slots are full (429), the job waits and is tried
+        again; that is not a failure. With `dest_dir`, a completed batch's files go to `dest_dir/<name or batch id>/`.
+        `on_progress(summary)` is called after every change with {"total", "done", "failed", "running", "waiting",
+        "result"}. Ctrl-C stops starting new jobs and re-raises; batches already started keep running on the server
+        (their ids are printed). Returns one RunResult per job, in the order of `jobs`.
+        """
+        if not isinstance(max_active, int) or not 1 <= max_active <= MAX_ACTIVE_LIMIT:
+            raise ValueError(f"max_active must be between 1 and {MAX_ACTIVE_LIMIT}, not {max_active!r}")
+        job_list = [dict(job) for job in jobs]
+        for job in job_list:
+            if "pipeline" not in job or not ({"upload_id", "inputs", "paths"} & set(job)):
+                raise ValueError(f"each job needs 'pipeline' and one of 'upload_id', 'inputs', 'paths': {job!r}")
+        results = [RunResult(index=i, job=job, batch_id=None, status="waiting", error=None, batch=None, paths=[])
+                   for i, job in enumerate(job_list)]
+        waiting = list(range(len(job_list)))
+        active: dict[int, str] = {}  # job index -> batch id
+        stopped = False
+        not_before = 0.0  # after a 429: when to try starting again
+
+        def report(result: RunResult) -> None:
+            if on_progress is None:
+                return
+            statuses = [r["status"] for r in results]
+            on_progress({
+                "total": len(results),
+                "done": statuses.count("complete"),
+                "failed": sum(statuses.count(s) for s in ("failed", "cancelled", "error")),
+                "running": len(active),
+                "waiting": len(waiting),
+                "result": result,
+            })
+
+        def finish(i: int, status: str, error: str | None = None, batch: Any = None) -> None:
+            nonlocal stopped
+            result = results[i]
+            result.update(status=status, error=error, batch=batch if batch is not None else result["batch"])
+            if status == "complete" and dest_dir is not None:
+                label = job_list[i].get("name") or result["batch_id"]
+                try:
+                    result["paths"] = self.download_artifacts(result["batch_id"], Path(dest_dir) / str(label))
+                except Exception as exc:  # noqa: BLE001 -- the batch itself completed
+                    result["error"] = f"download failed: {exc}"
+            if status != "complete" and stop_on_failure:
+                stopped = True
+            report(result)
+
+        def start(i: int) -> bool:
+            """True if the job left the waiting list (started, or failed to start); False to try again later."""
+            nonlocal not_before
+            job = job_list[i]
+            pipeline = job["pipeline"]
+            pipeline_id = pipeline["id"] if isinstance(pipeline, dict) else pipeline
+            try:
+                if "inputs" in job:
+                    inputs = job["inputs"]
+                else:
+                    upload_id = job.get("upload_id")
+                    if upload_id is None:
+                        upload_id = self.upload_files(job["paths"], name=job.get("name"))
+                        job["upload_id"] = upload_id  # a retry after a 429 does not upload again
+                    inputs = [{"slot": job.get("slot", "input"), "upload_id": upload_id}]
+                batch = self.create_batch(pipeline_id, inputs, use_latest_version=use_latest, name=job.get("name"))
+            except ForestSensAPIError as exc:
+                if exc.status == 429:
+                    wait_s = exc.retry_after if exc.retry_after is not None else DEFAULT_SLOT_WAIT_SECONDS
+                    not_before = time.monotonic() + max(wait_s, 1.0)
+                    return False
+                finish(i, "error", str(exc))
+                return True
+            except Exception as exc:  # noqa: BLE001 -- one job's upload/start problem, not the others'
+                finish(i, "error", f"{type(exc).__name__}: {exc}")
+                return True
+            results[i].update(batch_id=batch["id"], status="queued", batch=batch)
+            active[i] = batch["id"]
+            report(results[i])
+            return True
+
+        try:
+            while waiting or active:
+                # Start jobs while there is room (and no 429 pause, and not stopped).
+                while waiting and len(active) < max_active and not stopped and time.monotonic() >= not_before:
+                    i = waiting[0]
+                    if start(i):
+                        waiting.pop(0)
+                    else:
+                        break
+                if stopped and not active:
+                    break
+                if not active and waiting and not stopped:
+                    time.sleep(max(not_before - time.monotonic(), poll_interval))
+                    continue
+                time.sleep(poll_interval)
+                for i, batch_id in list(active.items()):
+                    try:
+                        batch = self.get_batch(batch_id)
+                    except ForestSensAPIError:
+                        continue  # a passing API problem: ask again next round
+                    status = batch.get("status")
+                    if status in ("complete", "failed", "cancelled"):
+                        del active[i]
+                        error = None if status == "complete" else (batch.get("error_message") or status)
+                        finish(i, status, error, batch)
+                    elif status != results[i]["status"]:
+                        results[i].update(status=status, batch=batch)
+                        report(results[i])
+        except KeyboardInterrupt:
+            if active:
+                print(f"\nstopped; {len(active)} batch(es) keep running on the server: {', '.join(active.values())}")
+            raise
+        for i in waiting:  # not started because of stop_on_failure
+            results[i].update(status="error", error="not started (stop_on_failure)")
+        return results
 
     # -- downloads ------------------------------------------------------------
 
@@ -963,7 +1155,7 @@ class Client:
         if not resp.ok or body.get("error"):
             err = body.get("error") or {}
             raise ForestSensAPIError(
-                resp.status_code, err.get("code", "unknown_error"), err.get("message", "")
+                resp.status_code, err.get("code", "unknown_error"), err.get("message", ""), retry_after=_retry_after(resp)
             )
         return {
             "items": body["data"],

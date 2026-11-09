@@ -52,6 +52,9 @@ again). It also enforces the storage limits (`413 storage_limit_exceeded`, see t
 Starts a pipeline run. Body: `{"pipeline_id": str, "inputs": [{"slot": str, "upload_id": str}]}`.
 Returns a batch record with `status: "queued"`.
 
+Limits: a user may have 20 batches queued or running, an account 50; one more is refused with `429 quota_exceeded`
+and a `Retry-After` header. `run_many()` and `create_batch(wait_for_slot=True)` wait instead of failing.
+
 ## `GET /v1/batches/{batch_id}`
 
 Poll this for status (`queued` -> `running` -> `complete`|`failed`), per-step detail (`steps[]`,

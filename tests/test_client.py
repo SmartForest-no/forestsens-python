@@ -1109,3 +1109,164 @@ def test_the_rate_limit_is_waited_out_and_then_given_up():
         with pytest.raises(ForestSensAPIError) as err:
             client.list_detections("b1")
     assert err.value.code == "rate_limited" and sleep.call_count == 4  # 5 tries, a wait between each
+
+
+# -- run_many --------------------------------------------------------------
+
+from pathlib import Path  # noqa: E402
+
+from forestsens import RunResult  # noqa: E402
+
+
+class FakeServer:
+    """Batches that finish after `polls` checks; records how many were in flight at once. `outcomes` maps a batch
+    number (1-based, in start order) to its final status; `refuse` makes the first N creates answer 429."""
+
+    def __init__(self, polls=2, outcomes=None, refuse=0, retry_after=30):
+        self.polls, self.outcomes, self.refuse, self.retry_after = polls, outcomes or {}, refuse, retry_after
+        self.created, self.seen, self.in_flight, self.max_in_flight = [], {}, set(), 0
+        self.now = 1000.0
+        self.slept = []
+
+    def create_batch(self, pipeline_id, inputs, *, use_latest_version=False, name=None, **_):
+        if self.refuse:
+            self.refuse -= 1
+            raise ForestSensAPIError(429, "quota_exceeded", "you already have 20 queued or running batches",
+                                     retry_after=self.retry_after)
+        number = len(self.created) + 1
+        batch_id = f"b{number}"
+        self.created.append({"id": batch_id, "pipeline": pipeline_id, "inputs": inputs, "name": name})
+        self.seen[batch_id] = 0
+        self.in_flight.add(batch_id)
+        self.max_in_flight = max(self.max_in_flight, len(self.in_flight))
+        return Batch({"id": batch_id, "status": "queued"})
+
+    def get_batch(self, batch_id):
+        self.seen[batch_id] += 1
+        if self.seen[batch_id] < self.polls:
+            return Batch({"id": batch_id, "status": "running"})
+        self.in_flight.discard(batch_id)
+        status = self.outcomes.get(int(batch_id[1:]), "complete")
+        return Batch({"id": batch_id, "status": status, "error_message": None if status == "complete" else "boom"})
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def monotonic(self):
+        return self.now
+
+
+def _run_many(server, jobs, **kwargs):
+    client = make_client()
+    client.create_batch = server.create_batch
+    client.get_batch = server.get_batch
+    with patch("time.sleep", server.sleep), patch("time.monotonic", server.monotonic):
+        return client, client.run_many(jobs, **kwargs)
+
+
+def test_run_many_keeps_at_most_max_active_in_flight_and_returns_in_order():
+    server = FakeServer(polls=2)
+    jobs = [{"pipeline": "p1", "upload_id": f"u{i}", "name": f"job{i}"} for i in range(7)]
+    _, results = _run_many(server, jobs, max_active=3, poll_interval=5)
+    assert server.max_in_flight == 3 and len(server.created) == 7
+    assert [r.status for r in results] == ["complete"] * 7
+    assert [r.job["name"] for r in results] == [f"job{i}" for i in range(7)]
+    assert all(isinstance(r, RunResult) for r in results)
+    assert server.created[0]["inputs"] == [{"slot": "input", "upload_id": "u0"}] and server.created[0]["name"] == "job0"
+
+
+def test_a_full_slot_list_is_waited_out_not_counted_as_a_failure():
+    server = FakeServer(polls=1, refuse=2, retry_after=30)
+    _, results = _run_many(server, [{"pipeline": "p", "upload_id": "u"}], max_active=2, poll_interval=5)
+    assert results[0].status == "complete" and results[0].batch_id == "b1"
+    assert server.slept.count(30) == 2  # waited the server's Retry-After twice
+
+
+def test_failed_and_cancelled_batches_are_recorded_and_the_rest_continue():
+    server = FakeServer(polls=1, outcomes={2: "failed", 3: "cancelled"})
+    _, results = _run_many(server, [{"pipeline": "p", "upload_id": f"u{i}"} for i in range(4)], max_active=1,
+                           poll_interval=1)
+    assert [r.status for r in results] == ["complete", "failed", "cancelled", "complete"]
+    assert results[1].error == "boom"
+
+
+def test_stop_on_failure_starts_nothing_new_but_waits_for_running_ones():
+    server = FakeServer(polls=2, outcomes={1: "failed"})
+    jobs = [{"pipeline": "p", "upload_id": f"u{i}"} for i in range(4)]
+    _, results = _run_many(server, jobs, max_active=2, poll_interval=1, stop_on_failure=True)
+    assert [r.status for r in results[:2]] == ["failed", "complete"]
+    assert [r.status for r in results[2:]] == ["error", "error"] and "stop_on_failure" in results[2].error
+    assert len(server.created) == 2
+
+
+def test_path_jobs_upload_just_before_starting_and_a_start_error_stays_on_its_job(tmp_path):
+    server = FakeServer(polls=1)
+    uploads = []
+
+    def upload_files(paths, name=None, **_):
+        uploads.append((paths, name, len(server.created)))
+        if name == "bad":
+            raise ForestSensAPIError(422, "validation_error", "no files")
+        return f"up-{name}"
+
+    client = make_client()
+    client.create_batch, client.get_batch, client.upload_files = server.create_batch, server.get_batch, upload_files
+    jobs = [{"pipeline": "p", "paths": "a/", "name": "first"}, {"pipeline": "p", "paths": "b/", "name": "bad"},
+            {"pipeline": "p", "paths": "c/", "name": "third"}]
+    with patch("time.sleep", server.sleep), patch("time.monotonic", server.monotonic):
+        results = client.run_many(jobs, max_active=1, poll_interval=1)
+    assert [r.status for r in results] == ["complete", "error", "complete"]
+    assert "no files" in results[1].error
+    assert [u[2] for u in uploads] == [0, 1, 1]  # each upload right before its own start, not all at once
+    assert server.created[1]["inputs"] == [{"slot": "input", "upload_id": "up-third"}]
+
+
+def test_dest_dir_gets_one_folder_per_job_and_progress_is_reported(tmp_path):
+    server = FakeServer(polls=1)
+    client = make_client()
+    client.create_batch, client.get_batch = server.create_batch, server.get_batch
+    downloads = []
+    client.download_artifacts = lambda batch_id, dest: downloads.append((batch_id, Path(dest))) or [str(dest)]
+    summaries = []
+    with patch("time.sleep", server.sleep), patch("time.monotonic", server.monotonic):
+        results = client.run_many([{"pipeline": "p", "upload_id": "u", "name": "flight1"},
+                                   {"pipeline": "p", "upload_id": "v"}],
+                                  max_active=2, poll_interval=1, dest_dir=tmp_path, on_progress=summaries.append)
+    assert downloads == [("b1", tmp_path / "flight1"), ("b2", tmp_path / "b2")]
+    assert results[0].paths == [str(tmp_path / "flight1")]
+    last = summaries[-1]
+    assert (last["total"], last["done"], last["failed"], last["running"], last["waiting"]) == (2, 2, 0, 0, 0)
+
+
+def test_run_many_checks_its_arguments():
+    client = make_client()
+    with pytest.raises(ValueError, match="between 1 and 20"):
+        client.run_many([], max_active=21)
+    with pytest.raises(ValueError, match="needs 'pipeline'"):
+        client.run_many([{"upload_id": "u"}])
+
+
+def test_create_batch_can_wait_for_a_free_slot():
+    client = make_client()
+    full = envelope_response(error={"code": "quota_exceeded", "message": "20 queued"}, status=429)
+    full.headers = {"Retry-After": "60"}
+    ok = envelope_response({"id": "b1", "status": "queued"})
+    clock = FakeServer()
+    with patch("requests.Session.request", side_effect=[full, full, ok]), \
+            patch("time.sleep", clock.sleep), patch("time.monotonic", clock.monotonic):
+        batch = client.create_batch("p", [{"slot": "input", "upload_id": "u"}], wait_for_slot=True)
+    assert batch.id == "b1" and clock.slept == [60.0, 60.0]
+    with patch("requests.Session.request", return_value=full), \
+            patch("time.sleep", clock.sleep), patch("time.monotonic", clock.monotonic):
+        with pytest.raises(ForestSensAPIError) as err:
+            client.create_batch("p", [], wait_for_slot=True, slot_timeout=100)
+    assert err.value.code == "quota_exceeded" and err.value.retry_after == 60.0
+
+
+def test_wait_for_batch_stops_at_a_cancelled_batch():
+    client = make_client()
+    with patch("requests.Session.request", return_value=envelope_response({"id": "b1", "status": "cancelled"})):
+        with pytest.raises(BatchFailedError) as err:
+            client.wait_for_batch("b1", poll_interval=0)
+    assert err.value.code == "batch_cancelled"

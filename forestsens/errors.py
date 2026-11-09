@@ -14,17 +14,22 @@ from typing import Any
 
 
 class ForestSensAPIError(Exception):
-    def __init__(self, status: int, code: str, message: str, details: Any = None) -> None:
+    """`retry_after`: seconds the server asked to wait (its `Retry-After` header, on a 429), else None."""
+
+    def __init__(
+        self, status: int, code: str, message: str, details: Any = None, retry_after: float | None = None
+    ) -> None:
         super().__init__(f"{code}: {message} (HTTP {status})")
         self.status = status
         self.code = code
         self.message = message
         self.details = details if details is not None else []
+        self.retry_after = retry_after
 
 
 class BatchFailedError(ForestSensAPIError):
     """Raised by Client.wait_for_batch when the batch itself reaches
-    status="failed" -- distinct from a transport/API error, since the
+    status="failed" or "cancelled" (code "batch_failed" / "batch_cancelled") -- distinct from a transport/API error, since the
     request that created/polled the batch succeeded fine. Carries the
     last-seen batch dict so a caller can inspect step-level detail
     (steps[].error / steps[].log_tail) without a second call.
@@ -32,8 +37,11 @@ class BatchFailedError(ForestSensAPIError):
 
     def __init__(self, batch: dict[str, Any]) -> None:
         self.batch = batch
-        message = batch.get("error_message") or "batch failed"
-        super().__init__(status=200, code="batch_failed", message=message, details=batch.get("steps"))
+        if batch.get("status") == "cancelled":
+            code, message = "batch_cancelled", batch.get("error_message") or "batch was cancelled"
+        else:
+            code, message = "batch_failed", batch.get("error_message") or "batch failed"
+        super().__init__(status=200, code=code, message=message, details=batch.get("steps"))
 
 
 class ForestSensNewerVersionWarning(UserWarning):

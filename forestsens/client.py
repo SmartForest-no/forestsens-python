@@ -300,22 +300,53 @@ class Client:
         assert path.startswith("/v1/"), f"expected a /v1/... path, got {path!r}"
         return f"https://{self.gateway_host}/v1-key{path[len('/v1'):]}"
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def _send(self, method: str, path: str, *, page: bool = False, **kwargs: Any) -> tuple[Any, Any]:
+        """One API call: (response, parsed body or None). A GET answered with 429 is waited out and asked again
+        (it changes nothing, so repeating is safe): the `Retry-After` seconds when given, else 2, 4, 8 ... up to 60,
+        at most RATE_LIMIT_ATTEMPTS tries. Writes are never repeated here; a full batch-slot list
+        (`quota_exceeded`) is create_batch(wait_for_slot=True)'s and run_many()'s to wait for."""
         headers = kwargs.pop("headers", {})
         headers["X-Api-Key"] = self.api_key
-        resp = self._session.request(method, self._url(path), headers=headers, **kwargs)
-        try:
-            body = resp.json()
-        except ValueError:
-            body = None
+        for attempt in range(1, RATE_LIMIT_ATTEMPTS + 1):
+            if page:  # list pages go through Session.get (as before), single calls through Session.request
+                resp = self._session.get(self._url(path), headers=headers, **kwargs)
+            else:
+                resp = self._session.request(method, self._url(path), headers=headers, **kwargs)
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            if resp.status_code != 429 or method != "GET" or attempt == RATE_LIMIT_ATTEMPTS:
+                break
+            error = body.get("error") if isinstance(body, dict) else None
+            if isinstance(error, dict) and error.get("code") == "quota_exceeded":
+                break
+            wait_s = _retry_after(resp)
+            if wait_s is None:
+                wait_s = 2.0 ** attempt
+            time.sleep(min(max(wait_s, 0.5), 60.0))
+        return resp, body
+
+    def _raise_for(self, resp: Any, body: Any) -> None:
         error = body.get("error") if isinstance(body, dict) else None
-        if not resp.ok or error:
-            retry_after = _retry_after(resp)
-            if error:
-                raise ForestSensAPIError(
-                    resp.status_code, error["code"], error["message"], error.get("details"), retry_after=retry_after
-                )
-            raise ForestSensAPIError(resp.status_code, "unknown_error", f"HTTP {resp.status_code}", retry_after=retry_after)
+        if resp.ok and not error:
+            return
+        retry_after = _retry_after(resp)
+        if isinstance(error, dict) and error.get("code"):
+            raise ForestSensAPIError(
+                resp.status_code, error["code"], error.get("message", ""), error.get("details"), retry_after=retry_after
+            )
+        if resp.status_code == 429:
+            # Not the API's own answer: the API Gateway in front of it limits requests per client IP, and answers
+            # without the error envelope. Same meaning as the API's per-key `rate_limited`.
+            raise ForestSensAPIError(
+                429, "rate_limited", "HTTP 429: too many requests; slow down and try again", retry_after=retry_after
+            )
+        raise ForestSensAPIError(resp.status_code, "unknown_error", f"HTTP {resp.status_code}", retry_after=retry_after)
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        resp, body = self._send(method, path, **kwargs)
+        self._raise_for(resp, body)
         return body["data"] if isinstance(body, dict) and "data" in body else body
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -981,10 +1012,10 @@ class Client:
                     time.sleep(max(not_before - time.monotonic(), poll_interval))
                     continue
                 time.sleep(poll_interval)
+                current = self._current_batches(list(active.values()))
                 for i, batch_id in list(active.items()):
-                    try:
-                        batch = self.get_batch(batch_id)
-                    except ForestSensAPIError:
+                    batch = current.get(batch_id)
+                    if batch is None:
                         continue  # a passing API problem: ask again next round
                     status = batch.get("status")
                     if status in ("complete", "failed", "cancelled"):
@@ -1001,6 +1032,26 @@ class Client:
         for i in waiting:  # not started because of stop_on_failure
             results[i].update(status="error", error="not started (stop_on_failure)")
         return results
+
+    def _current_batches(self, batch_ids: list[str]) -> dict[str, Batch]:
+        """The current state of `batch_ids`, with as few requests as possible: one page of the user's newest batches
+        (run_many's own are among them) instead of one get_batch per batch, then get_batch only for any not on that
+        page. A batch that cannot be read right now is left out (asked again next round)."""
+        found: dict[str, Batch] = {}
+        if len(batch_ids) > 1:
+            wanted = set(batch_ids)
+            try:
+                page, _ = self.list_batches(created_by="me", sort="created", direction="desc", limit=100)
+                found = {b["id"]: b for b in page if b.get("id") in wanted}
+            except ForestSensAPIError:
+                pass
+        for batch_id in batch_ids:
+            if batch_id not in found:
+                try:
+                    found[batch_id] = self.get_batch(batch_id)
+                except ForestSensAPIError:
+                    pass
+        return found
 
     # -- downloads ------------------------------------------------------------
 
@@ -1140,23 +1191,8 @@ class Client:
         return written
 
     def _request_page(self, path: str, params: dict[str, Any] | None) -> dict[str, Any]:
-        headers = {"X-Api-Key": self.api_key}
-        for attempt in range(1, RATE_LIMIT_ATTEMPTS + 1):
-            resp = self._session.get(self._url(path), headers=headers, params=params)
-            if resp.status_code != 429 or attempt == RATE_LIMIT_ATTEMPTS:
-                break
-            # The per-key rate limit (paging a large result table can reach it): wait as told, then ask again.
-            try:
-                wait_s = float(resp.headers.get("Retry-After", 1))
-            except (TypeError, ValueError):
-                wait_s = 1.0
-            time.sleep(min(max(wait_s, 0.5), 60))
-        body = resp.json()
-        if not resp.ok or body.get("error"):
-            err = body.get("error") or {}
-            raise ForestSensAPIError(
-                resp.status_code, err.get("code", "unknown_error"), err.get("message", ""), retry_after=_retry_after(resp)
-            )
+        resp, body = self._send("GET", path, page=True, params=params)
+        self._raise_for(resp, body)
         return {
             "items": body["data"],
             "next_cursor": (body.get("meta", {}).get("pagination") or {}).get("next_cursor"),

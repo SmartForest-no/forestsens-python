@@ -1149,6 +1149,11 @@ class FakeServer:
         status = self.outcomes.get(int(batch_id[1:]), "complete")
         return Batch({"id": batch_id, "status": status, "error_message": None if status == "complete" else "boom"})
 
+    def list_batches(self, **_):
+        """The user's newest batches, as run_many reads them when several are in flight (one request per round)."""
+        self.list_calls = getattr(self, "list_calls", 0) + 1
+        return [self.get_batch(batch_id) for batch_id in sorted(self.in_flight)], None
+
     def sleep(self, seconds):
         self.slept.append(seconds)
         self.now += seconds
@@ -1161,6 +1166,7 @@ def _run_many(server, jobs, **kwargs):
     client = make_client()
     client.create_batch = server.create_batch
     client.get_batch = server.get_batch
+    client.list_batches = server.list_batches
     with patch("time.sleep", server.sleep), patch("time.monotonic", server.monotonic):
         return client, client.run_many(jobs, **kwargs)
 
@@ -1212,6 +1218,7 @@ def test_path_jobs_upload_just_before_starting_and_a_start_error_stays_on_its_jo
 
     client = make_client()
     client.create_batch, client.get_batch, client.upload_files = server.create_batch, server.get_batch, upload_files
+    client.list_batches = server.list_batches
     jobs = [{"pipeline": "p", "paths": "a/", "name": "first"}, {"pipeline": "p", "paths": "b/", "name": "bad"},
             {"pipeline": "p", "paths": "c/", "name": "third"}]
     with patch("time.sleep", server.sleep), patch("time.monotonic", server.monotonic):
@@ -1226,6 +1233,7 @@ def test_dest_dir_gets_one_folder_per_job_and_progress_is_reported(tmp_path):
     server = FakeServer(polls=1)
     client = make_client()
     client.create_batch, client.get_batch = server.create_batch, server.get_batch
+    client.list_batches = server.list_batches
     downloads = []
     client.download_artifacts = lambda batch_id, dest: downloads.append((batch_id, Path(dest))) or [str(dest)]
     summaries = []
@@ -1270,3 +1278,55 @@ def test_wait_for_batch_stops_at_a_cancelled_batch():
         with pytest.raises(BatchFailedError) as err:
             client.wait_for_batch("b1", poll_interval=0)
     assert err.value.code == "batch_cancelled"
+
+
+def test_run_many_reads_several_batches_with_one_list_request_per_round():
+    server = FakeServer(polls=3)
+    calls = []
+    original = server.get_batch
+    jobs = [{"pipeline": "p", "upload_id": f"u{i}"} for i in range(4)]
+    client = make_client()
+    client.create_batch = server.create_batch
+    client.list_batches = server.list_batches
+    client.get_batch = lambda batch_id: calls.append(batch_id) or original(batch_id)
+    with patch("time.sleep", server.sleep), patch("time.monotonic", server.monotonic):
+        results = client.run_many(jobs, max_active=4, poll_interval=1)
+    assert [r.status for r in results] == ["complete"] * 4
+    assert calls == []  # never one request per batch while several were in flight
+    assert server.list_calls == 3
+
+
+def _raw(status, headers=None, body=None):
+    resp = MagicMock(status_code=status, ok=200 <= status < 300, headers=headers or {})
+    if body is None:
+        resp.json.side_effect = ValueError("not json")
+    else:
+        resp.json.return_value = body
+    return resp
+
+
+def test_a_gateway_429_on_a_read_is_waited_out_and_retried():
+    client = make_client()
+    gateway = _raw(429, {"Retry-After": "3"}, {"message": "Too Many Requests", "code": 429})
+    ok = envelope_response({"id": "b1", "status": "running"})
+    with patch("requests.Session.request", side_effect=[gateway, _raw(429), ok]), patch("time.sleep") as sleep:
+        batch = client.get_batch("b1")
+    assert batch.id == "b1"
+    assert [c.args[0] for c in sleep.call_args_list] == [3.0, 4.0]  # Retry-After, then backoff 2**2
+
+
+def test_a_gateway_429_that_persists_is_raised_as_rate_limited():
+    client = make_client()
+    with patch("requests.Session.request", return_value=_raw(429)), patch("time.sleep") as sleep:
+        with pytest.raises(ForestSensAPIError) as err:
+            client.get_batch("b1")
+    assert err.value.status == 429 and err.value.code == "rate_limited"
+    assert sleep.call_count == 4 and [c.args[0] for c in sleep.call_args_list] == [2.0, 4.0, 8.0, 16.0]
+
+
+def test_writes_are_not_retried_on_a_429():
+    client = make_client()
+    with patch("requests.Session.request", return_value=_raw(429)) as req, patch("time.sleep") as sleep:
+        with pytest.raises(ForestSensAPIError) as err:
+            client.create_batch("p", [{"slot": "input", "upload_id": "u"}])
+    assert err.value.code == "rate_limited" and req.call_count == 1 and sleep.call_count == 0

@@ -220,7 +220,9 @@ client.save_results(batch.id, "results")  # results/segments.geojson etc., one f
 
 Which tables a batch has is in `batch["results"]` (each `{count, href}`, or `None`). Rows are dicts with attribute
 access; `class` is a Python keyword, so it is `row["class"]` or `row.class_`. Pages hold up to 1000 rows; a
-`429 rate_limited` while paging is waited out (`Retry-After`) and retried.
+`429 rate_limited` on any read (paging, `get_batch`, `list_batches`, ...) is waited out and retried (v3.6.1+): the
+`Retry-After` seconds, else 2, 4, 8 ... up to 60, five tries in all. Writes (`create_batch`, uploads) are not repeated;
+`create_batch(wait_for_slot=True)` and `run_many()` wait for a free batch slot (`quota_exceeded`).
 
 ### Errors
 
@@ -234,7 +236,7 @@ string, not just an HTTP status. The ones you will meet:
 | 404 | `not_found` | Wrong id, or the dataset is private and not shared with you. |
 | 413 | `storage_limit_exceeded` | A dataset or your account would hold more data than allowed. Retrying does not help: delete datasets, split the dataset, or ask for a higher limit. |
 | 422 | `validation_error` | The request is wrong, or (on completing an upload) some files did not arrive: `details` names them; upload them and call again. |
-| 429 | `rate_limited`, `quota_exceeded` | Too many requests or batches; wait the `Retry-After` seconds. |
+| 429 | `rate_limited`, `quota_exceeded` | Too many requests or batches; wait the `Retry-After` seconds. Reads are retried for you; a 429 from the gateway in front of the API (limit per client IP, no error body) is also `rate_limited`. |
 
 The limits and the full error table are in the platform documentation (API page). `forestsens.BatchFailedError` is a
 subclass raised specifically by `wait_for_batch` when the batch itself reaches `status="failed"` (as opposed to a

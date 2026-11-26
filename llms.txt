@@ -166,7 +166,7 @@ forestsens.BatchFailedError(batch: dict)  # subclass of ForestSensAPIError, code
   `/v1-key/...`).
 - Result rows: `class` is a Python keyword, so use `row["class"]` or `row.class_`. `batch["results"]` says which
   tables a batch has (`{count, href}` or None). Big tables are paged (1000 rows); `get_results()` follows all pages
-  and waits out a `429 rate_limited`.
+  and waits out a `429 rate_limited`; since v3.6.1 every read does (get_batch, list_batches, ...), writes never repeat.
 - Error codes you will meet: `unauthenticated` (401), `forbidden` (403), `not_found` (404),
   `storage_limit_exceeded` (413, retrying does not help: delete or split data, or ask for a higher limit),
   `validation_error` (422; completing an upload with missing files lists them in `.details`),
